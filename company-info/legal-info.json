@@ -1,0 +1,41 @@
+{
+  "company": {
+    "name": "株式会社TechWorker",
+    "nameKana": "てっくわーかー",
+    "corporateNumber": "9011101105629",
+    "address": {
+      "postalCode": "169-0051",
+      "prefecture": "東京都",
+      "city": "新宿区",
+      "address": "西早稲田1丁目22番3号",
+      "fullAddress": "〒169-0051 東京都新宿区西早稲田1丁目22番3号"
+    },
+    "established": "2023年12月22日",
+    "capital": "50万円",
+    "representative": {
+      "ceo": "代表取締役 古野光太朗",
+      "director": "取締役 山本敏行"
+    }
+  },
+  "contact": {
+    "website": "https://techworker.co.jp/",
+    "twitter": "@tech_worker_",
+    "supportEmail": "support@techworker.co.jp",
+    "phone": "03-1234-5678",
+    "phoneNote": "請求により遅滞なく開示"
+  },
+  "business": {
+    "description": "生成AIの法人向け研修・人材育成事業、生成AI/LLMの受託開発・チャットボット開発、業務効率化コンサルティング",
+    "services": [
+      "寺子屋（AI指導官 × タスク管理ボット）",
+      "生成AI研修サービス",
+      "AI受託開発",
+      "業務効率化コンサルティング"
+    ]
+  },
+  "legal": {
+    "governingLaw": "日本法",
+    "jurisdiction": "東京地方裁判所",
+    "dataProtection": "個人情報保護法に基づく適切な管理"
+  }
+}
