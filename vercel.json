@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "name": "line-openai-bot",
+  "builds": [
+    {
+      "src": "src/server.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "src/server.js"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/notify",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/expire",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
