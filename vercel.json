@@ -9,14 +9,6 @@
   ],
   "routes": [
     {
-      "src": "/legal/terms.html",
-      "dest": "/public/legal/terms.html"
-    },
-    {
-      "src": "/legal/privacy.html",
-      "dest": "/public/legal/privacy.html"
-    },
-    {
       "src": "/(.*)",
       "dest": "src/server.js"
     }
