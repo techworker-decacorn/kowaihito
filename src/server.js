@@ -20,6 +20,9 @@ dayjs.locale('ja');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// 静的ファイル配信の設定
+app.use('/legal', express.static('public/legal'));
+
 // LINE Bot設定
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
