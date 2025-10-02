@@ -23,6 +23,25 @@ const PORT = process.env.PORT || 3000;
 // 静的ファイル配信の設定
 app.use('/legal', express.static('public/legal'));
 
+// デバッグ用：静的ファイルの存在確認
+app.get('/debug/legal', (req, res) => {
+  const fs = require('fs');
+  const path = require('path');
+  
+  const termsPath = path.join(__dirname, '../public/legal/terms.html');
+  const privacyPath = path.join(__dirname, '../public/legal/privacy.html');
+  
+  res.json({
+    termsExists: fs.existsSync(termsPath),
+    privacyExists: fs.existsSync(privacyPath),
+    termsPath: termsPath,
+    privacyPath: privacyPath,
+    currentDir: __dirname,
+    publicDir: path.join(__dirname, '../public'),
+    legalDir: path.join(__dirname, '../public/legal')
+  });
+});
+
 // LINE Bot設定
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
