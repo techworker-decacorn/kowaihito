@@ -8,6 +8,7 @@ const timezone = require('dayjs/plugin/timezone');
 const Stripe = require('stripe');
 const chrono = require('chrono-node');
 const axios = require('axios');
+const path = require('path');
 require('dayjs/locale/ja');
 require('dotenv').config();
 
@@ -21,7 +22,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // 静的ファイル配信の設定
-app.use('/legal', express.static('public/legal'));
+app.use('/legal', express.static(path.join(__dirname, '../public/legal')));
 
 // デバッグ用：静的ファイルの存在確認
 app.get('/debug/legal', (req, res) => {
