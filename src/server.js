@@ -181,13 +181,15 @@ async function parseNegotiationIntent(text) {
           student: { type:"boolean" },
           will_post_on_x: { type:"boolean" },
           accept: { type:"boolean", description:"この価格で合意か" },
+          occupation: { type:"string", description:"職種・立場（学生、フリーランス、会社員、経営者、無職など）" },
+          income_level: { type:"string", description:"収入レベル（低、中、高）" },
           reasons: { type:"array", items:{ type:"string" } }
         }
       }
     }
   }];
 
-  const sys = "あなたは価格交渉の抽出器。数値やYes/Noを厳密抽出。曖昧ならnull/false。";
+  const sys = "あなたは価格交渉の抽出器。数値やYes/Noを厳密抽出。職種・立場・収入レベルも判定。曖昧ならnull/false。";
   const r = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [{ role:"system", content: sys }, { role:"user", content: text }],
@@ -199,29 +201,67 @@ async function parseNegotiationIntent(text) {
   return JSON.parse(call.function.arguments || "{}");
 }
 
-// 簡易ポリシー：希望等から次の提示額を決める
+// 職種・立場に基づく価格決定ロジック
 function decideNextOffer(sess, facts) {
   let score = sess.score || 0;
+  const anchor = sess.anchor_price;
+  const floor = parseInt(process.env.NEGOTIATION_FLOOR_YEN || '2000', 10);
+  const max = parseInt(process.env.NEGOTIATION_MAX_YEN || '10000', 10);
+
+  // 職種・立場による基本スコア調整
+  if (facts.occupation) {
+    const occupation = facts.occupation.toLowerCase();
+    if (occupation.includes('学生') || occupation.includes('無職')) {
+      score += 3;
+    } else if (occupation.includes('フリーランス') || occupation.includes('個人事業主')) {
+      score += 2;
+    } else if (occupation.includes('会社員') || occupation.includes('サラリーマン')) {
+      score += 1;
+    } else if (occupation.includes('経営者') || occupation.includes('役員')) {
+      score -= 1;
+    }
+  }
+
+  // 収入レベルによる調整
+  if (facts.income_level) {
+    const income = facts.income_level.toLowerCase();
+    if (income.includes('低')) score += 2;
+    else if (income.includes('中')) score += 1;
+    else if (income.includes('高')) score -= 1;
+  }
+
+  // その他の条件
   if (facts.student) score += 2;
   if (facts.will_post_on_x) score += 2;
   if (facts.wants_yearly) score += 1;
   if (facts.reasons?.length > 0) score += 1;
 
-  const anchor = sess.anchor_price;
-  const floor  = sess.floor_price;
-
-  // 目安レンジ
-  let pct;
-  if (score >= 4)      pct = 0.2;  // 大幅
-  else if (score >= 2) pct = 0.4;  // 中程度
-  else                 pct = 0.6;  // 小幅
+  // スコアに基づく価格計算（2,000円〜10,000円の範囲）
+  let target;
+  if (score >= 5) {
+    // 大幅値引き（学生・無職など）
+    target = Math.max(floor, Math.round(anchor * 0.5));
+  } else if (score >= 3) {
+    // 中程度値引き（フリーランスなど）
+    target = Math.max(floor, Math.round(anchor * 0.7));
+  } else if (score >= 1) {
+    // 小幅値引き（一般会社員など）
+    target = Math.max(floor, Math.round(anchor * 0.9));
+  } else if (score <= -1) {
+    // プレミアム価格（経営者など）
+    target = Math.min(max, Math.round(anchor * 1.5));
+  } else {
+    // 標準価格
+    target = anchor;
+  }
 
   // 予算を主張していればそれも考慮
-  let target = Math.round(anchor * pct);
-  if (Number.isFinite(facts.budget)) target = Math.min(target, Math.max(floor, facts.budget|0));
+  if (Number.isFinite(facts.budget)) {
+    target = Math.min(target, Math.max(floor, facts.budget|0));
+  }
 
-  // 下限を守る
-  target = Math.max(floor, target);
+  // 範囲内に収める
+  target = Math.max(floor, Math.min(max, target));
 
   return { nextAmount: target, nextScore: score };
 }
@@ -1299,7 +1339,7 @@ async function handleEvent(event, ctx = {}) {
       const sess = await getOrCreateNegotiation(profile);
       await client.replyMessage(event.replyToken, {
         type:'text',
-        text: `標準は¥${sess.anchor_price.toLocaleString()}/月。だが交渉は歓迎だ。\n根拠を示せ。予算、学生、年払い、Xでレビュー投稿——何が出せる？`
+        text: `標準は¥${sess.anchor_price.toLocaleString()}/月。だが交渉は歓迎だ。\n職種・立場・収入を教えろ。学生、フリーランス、会社員、経営者——どれだ？\n予算、年払い、Xでレビュー投稿も考慮する。`
       });
       return;
     }
@@ -1321,7 +1361,7 @@ async function handleEvent(event, ctx = {}) {
     }
 
     // 交渉の通常発話（値引き主張など）
-    if (/円|無料|ただ|年払い|学生|学割|X|Twitter|ツイッター|投稿|レビュー/i.test(text)) {
+    if (/円|無料|ただ|年払い|学生|学割|X|Twitter|ツイッター|投稿|レビュー|会社員|フリーランス|経営者|役員|無職|収入|給料/i.test(text)) {
       const sess = await getOrCreateNegotiation(profile);
       const facts = await parseNegotiationIntent(text);
       const { nextAmount, nextScore } = decideNextOffer(sess, facts);
@@ -1332,9 +1372,17 @@ async function handleEvent(event, ctx = {}) {
         meta: { ...(sess.meta||{}), facts }
       });
 
+      // 職種・立場に応じたメッセージ
+      let conditionText = '';
+      if (facts.occupation) conditionText += `${facts.occupation} / `;
+      if (facts.income_level) conditionText += `収入${facts.income_level} / `;
+      if (facts.wants_yearly) conditionText += '年払いOK / ';
+      if (facts.will_post_on_x) conditionText += 'Xでレビュー投稿 / ';
+      if (facts.student) conditionText += '学生証明 / ';
+
       const buttons = {
         type: 'text',
-        text: `提示は **¥${nextAmount.toLocaleString()}/月**。条件: ${facts.wants_yearly?'年払いOK / ':''}${facts.will_post_on_x?'Xでレビュー投稿 / ':''}${facts.student?'学生証明 / ':''}合意なら「合意」と送れ。`
+        text: `提示は **¥${nextAmount.toLocaleString()}/月**。\n条件: ${conditionText}合意なら「合意」と送れ。`
       };
       await client.replyMessage(event.replyToken, buttons);
       return;
