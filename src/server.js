@@ -166,34 +166,74 @@ async function updateNegotiation(id, patch) {
   return data;
 }
 
-// OpenAIで交渉インテント抽出（自然言語→構造化）
-async function parseNegotiationIntent(text) {
+// 超優秀なビジネスマンとしての交渉分析
+async function analyzeNegotiationContext(text, sessionHistory = []) {
   const tools = [{
     type: "function",
     function: {
-      name: "negotiate_extract",
-      description: "交渉発話から要素抽出",
+      name: "business_negotiation_analysis",
+      description: "ビジネス交渉の分析と価格決定",
       parameters: {
         type: "object",
         properties: {
-          budget: { type:"number", description:"希望月額(円)。なければnull" },
-          wants_yearly: { type:"boolean" },
-          student: { type:"boolean" },
-          will_post_on_x: { type:"boolean" },
-          accept: { type:"boolean", description:"この価格で合意か" },
-          occupation: { type:"string", description:"職種・立場（学生、フリーランス、会社員、経営者、無職など）" },
-          income_level: { type:"string", description:"収入レベル（低、中、高）" },
-          reasons: { type:"array", items:{ type:"string" } }
+          user_profile: { 
+            type: "object",
+            properties: {
+              occupation: { type:"string", description:"職種・立場" },
+              income_level: { type:"string", description:"収入レベル（低・中・高）" },
+              company_size: { type:"string", description:"会社規模（個人・中小・大企業）" },
+              decision_power: { type:"string", description:"決定権限（個人・部署・経営）" },
+              urgency: { type:"string", description:"緊急度（低・中・高）" }
+            }
+          },
+          negotiation_tactics: {
+            type: "object", 
+            properties: {
+              is_lying: { type:"boolean", description:"嘘をついている可能性" },
+              pressure_tactics: { type:"array", items:{ type:"string" }, description:"圧力戦術の使用" },
+              emotional_appeal: { type:"boolean", description:"感情に訴えている" },
+              budget_constraints: { type:"boolean", description:"予算制約の主張" },
+              alternative_options: { type:"boolean", description:"他社との比較" }
+            }
+          },
+          recommended_price: { type:"number", description:"推奨価格（円）" },
+          negotiation_strategy: { type:"string", description:"交渉戦略" },
+          next_question: { type:"string", description:"次の質問" }
         }
       }
     }
   }];
 
-  const sys = "あなたは価格交渉の抽出器。数値やYes/Noを厳密抽出。職種・立場・収入レベルも判定。曖昧ならnull/false。";
+  const sys = `あなたは超優秀なビジネスマンとして価格交渉を分析する。ユーザーの嘘や圧力戦術を見抜き、適切な価格を決定する。
+  
+  交渉の原則：
+  1. ユーザーの嘘や誇張を見抜く
+  2. 真の価値と支払い能力を評価
+  3. 感情的アピールには冷静に対応
+  4. 圧力戦術には毅然とした態度
+  5. 適切な価格で合意に導く
+  
+  価格決定基準：
+  - 学生・無職: 2,000-3,000円
+  - フリーランス: 3,000-4,000円  
+  - 一般会社員: 4,000-5,000円
+  - 管理職: 5,000-7,000円
+  - 経営者: 7,000-10,000円`;
+
+  const historyContext = sessionHistory.length > 0 ? 
+    `\n\n交渉履歴:\n${sessionHistory.map(h => `${h.role}: ${h.content}`).join('\n')}` : '';
+
   const r = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    messages: [{ role:"system", content: sys }, { role:"user", content: text }],
-    tools, tool_choice:{ type:"function", function:{ name:"negotiate_extract" } }
+    messages: [{ 
+      role:"system", 
+      content: sys + historyContext 
+    }, { 
+      role:"user", 
+      content: text 
+    }],
+    tools, 
+    tool_choice:{ type:"function", function:{ name:"business_negotiation_analysis" } }
   });
 
   const call = r.choices?.[0]?.message?.tool_calls?.[0];
@@ -201,69 +241,86 @@ async function parseNegotiationIntent(text) {
   return JSON.parse(call.function.arguments || "{}");
 }
 
-// 職種・立場に基づく価格決定ロジック
-function decideNextOffer(sess, facts) {
-  let score = sess.score || 0;
-  const anchor = sess.anchor_price;
+// 超優秀なビジネスマンとしての価格決定
+function decideBusinessPrice(analysis, sessionHistory = []) {
   const floor = parseInt(process.env.NEGOTIATION_FLOOR_YEN || '2000', 10);
   const max = parseInt(process.env.NEGOTIATION_MAX_YEN || '10000', 10);
+  
+  // AI分析結果を優先
+  if (analysis.recommended_price) {
+    return Math.max(floor, Math.min(max, analysis.recommended_price));
+  }
 
-  // 職種・立場による基本スコア調整
-  if (facts.occupation) {
-    const occupation = facts.occupation.toLowerCase();
+  // フォールバック: プロフィールベースの価格決定
+  const profile = analysis.user_profile || {};
+  const tactics = analysis.negotiation_tactics || {};
+  
+  let basePrice = 3980; // 標準価格
+  
+  // 職種による基本価格
+  if (profile.occupation) {
+    const occupation = profile.occupation.toLowerCase();
     if (occupation.includes('学生') || occupation.includes('無職')) {
-      score += 3;
+      basePrice = 2500;
     } else if (occupation.includes('フリーランス') || occupation.includes('個人事業主')) {
-      score += 2;
+      basePrice = 3500;
     } else if (occupation.includes('会社員') || occupation.includes('サラリーマン')) {
-      score += 1;
-    } else if (occupation.includes('経営者') || occupation.includes('役員')) {
-      score -= 1;
+      basePrice = 4500;
+    } else if (occupation.includes('管理職') || occupation.includes('部長') || occupation.includes('課長')) {
+      basePrice = 6000;
+    } else if (occupation.includes('経営者') || occupation.includes('役員') || occupation.includes('CEO')) {
+      basePrice = 8000;
     }
   }
 
   // 収入レベルによる調整
-  if (facts.income_level) {
-    const income = facts.income_level.toLowerCase();
-    if (income.includes('低')) score += 2;
-    else if (income.includes('中')) score += 1;
-    else if (income.includes('高')) score -= 1;
+  if (profile.income_level) {
+    const income = profile.income_level.toLowerCase();
+    if (income.includes('低')) {
+      basePrice = Math.max(floor, Math.round(basePrice * 0.8));
+    } else if (income.includes('高')) {
+      basePrice = Math.min(max, Math.round(basePrice * 1.2));
+    }
   }
 
-  // その他の条件
-  if (facts.student) score += 2;
-  if (facts.will_post_on_x) score += 2;
-  if (facts.wants_yearly) score += 1;
-  if (facts.reasons?.length > 0) score += 1;
-
-  // スコアに基づく価格計算（2,000円〜10,000円の範囲）
-  let target;
-  if (score >= 5) {
-    // 大幅値引き（学生・無職など）
-    target = Math.max(floor, Math.round(anchor * 0.5));
-  } else if (score >= 3) {
-    // 中程度値引き（フリーランスなど）
-    target = Math.max(floor, Math.round(anchor * 0.7));
-  } else if (score >= 1) {
-    // 小幅値引き（一般会社員など）
-    target = Math.max(floor, Math.round(anchor * 0.9));
-  } else if (score <= -1) {
-    // プレミアム価格（経営者など）
-    target = Math.min(max, Math.round(anchor * 1.5));
-  } else {
-    // 標準価格
-    target = anchor;
+  // 会社規模による調整
+  if (profile.company_size) {
+    const size = profile.company_size.toLowerCase();
+    if (size.includes('大企業') || size.includes('上場')) {
+      basePrice = Math.min(max, Math.round(basePrice * 1.3));
+    } else if (size.includes('個人') || size.includes('零細')) {
+      basePrice = Math.max(floor, Math.round(basePrice * 0.7));
+    }
   }
 
-  // 予算を主張していればそれも考慮
-  if (Number.isFinite(facts.budget)) {
-    target = Math.min(target, Math.max(floor, facts.budget|0));
+  // 決定権限による調整
+  if (profile.decision_power) {
+    const power = profile.decision_power.toLowerCase();
+    if (power.includes('経営') || power.includes('役員')) {
+      basePrice = Math.min(max, Math.round(basePrice * 1.2));
+    } else if (power.includes('個人')) {
+      basePrice = Math.max(floor, Math.round(basePrice * 0.8));
+    }
+  }
+
+  // 嘘や圧力戦術の検出による価格調整
+  if (tactics.is_lying) {
+    // 嘘が検出された場合は標準価格を維持
+    basePrice = Math.max(basePrice, 3980);
+  }
+
+  if (tactics.pressure_tactics && tactics.pressure_tactics.length > 0) {
+    // 圧力戦術には毅然とした価格を提示
+    basePrice = Math.max(basePrice, 4500);
+  }
+
+  if (tactics.emotional_appeal) {
+    // 感情的アピールには冷静な価格
+    basePrice = Math.max(basePrice, 4000);
   }
 
   // 範囲内に収める
-  target = Math.max(floor, Math.min(max, target));
-
-  return { nextAmount: target, nextScore: score };
+  return Math.max(floor, Math.min(max, basePrice));
 }
 
 // ==== 共通ユーティリティ ====
@@ -1334,12 +1391,28 @@ async function handleEvent(event, ctx = {}) {
     }
     // ===== 新規ショートカット解析 終了 =====
 
-    // 交渉: "交渉" で開始／価格を言うと継続
+    // 交渉: "交渉" で開始
     if (/^(交渉|アップグレード交渉|値段|ねだん|価格)$/i.test(text)) {
       const sess = await getOrCreateNegotiation(profile);
+      
+      // 交渉履歴を取得
+      const { data: history } = await supabase
+        .from('negotiation_sessions')
+        .select('meta')
+        .eq('id', sess.id)
+        .single();
+      
+      const sessionHistory = history?.meta?.conversation_history || [];
+      
       await client.replyMessage(event.replyToken, {
         type:'text',
-        text: `標準は¥${sess.anchor_price.toLocaleString()}/月。だが交渉は歓迎だ。\n職種・立場・収入を教えろ。学生、フリーランス、会社員、経営者——どれだ？\n予算、年払い、Xでレビュー投稿も考慮する。`
+        text: `よし、交渉だ。\n\nまず聞く。あなたは何者だ？\n職種、会社規模、年収、決定権限——すべて正直に話せ。\n\n嘘は見抜く。適当な回答には適当な価格しか提示しない。\n\n本気で交渉するなら、まず自分の立場を明確にしろ。`
+      });
+      
+      // 交渉履歴を保存
+      const newHistory = [...sessionHistory, { role: 'bot', content: '交渉開始' }];
+      await updateNegotiation(sess.id, { 
+        meta: { ...(sess.meta || {}), conversation_history: newHistory }
       });
       return;
     }
@@ -1360,31 +1433,66 @@ async function handleEvent(event, ctx = {}) {
       return;
     }
 
-    // 交渉の通常発話（値引き主張など）
-    if (/円|無料|ただ|年払い|学生|学割|X|Twitter|ツイッター|投稿|レビュー|会社員|フリーランス|経営者|役員|無職|収入|給料/i.test(text)) {
+    // 交渉の通常発話（対話ベース）
+    if (/円|無料|ただ|年払い|学生|学割|X|Twitter|ツイッター|投稿|レビュー|会社員|フリーランス|経営者|役員|無職|収入|給料|年収|会社|企業|部署|部長|課長|CEO|社長|代表|取締役|管理職|一般職|正社員|契約社員|パート|アルバイト|フリー|個人事業|零細|中小|大企業|上場|スタートアップ/i.test(text)) {
       const sess = await getOrCreateNegotiation(profile);
-      const facts = await parseNegotiationIntent(text);
-      const { nextAmount, nextScore } = decideNextOffer(sess, facts);
-
+      
+      // 交渉履歴を取得
+      const { data: history } = await supabase
+        .from('negotiation_sessions')
+        .select('meta')
+        .eq('id', sess.id)
+        .single();
+      
+      const sessionHistory = history?.meta?.conversation_history || [];
+      
+      // 超優秀なビジネスマンとして分析
+      const analysis = await analyzeNegotiationContext(text, sessionHistory);
+      const recommendedPrice = decideBusinessPrice(analysis, sessionHistory);
+      
+      // 交渉履歴を更新
+      const newHistory = [
+        ...sessionHistory, 
+        { role: 'user', content: text },
+        { role: 'bot', content: `分析結果: ${JSON.stringify(analysis)}` }
+      ];
+      
       await updateNegotiation(sess.id, {
-        score: nextScore,
-        current_offer: nextAmount,
-        meta: { ...(sess.meta||{}), facts }
+        current_offer: recommendedPrice,
+        meta: { 
+          ...(sess.meta || {}), 
+          conversation_history: newHistory,
+          last_analysis: analysis
+        }
       });
 
-      // 職種・立場に応じたメッセージ
-      let conditionText = '';
-      if (facts.occupation) conditionText += `${facts.occupation} / `;
-      if (facts.income_level) conditionText += `収入${facts.income_level} / `;
-      if (facts.wants_yearly) conditionText += '年払いOK / ';
-      if (facts.will_post_on_x) conditionText += 'Xでレビュー投稿 / ';
-      if (facts.student) conditionText += '学生証明 / ';
-
-      const buttons = {
+      // 超優秀なビジネスマンとしての返答
+      let response = `分析した。`;
+      
+      if (analysis.negotiation_tactics?.is_lying) {
+        response += `\n\n嘘は見抜いた。適当な回答には適当な価格しか提示しない。`;
+      }
+      
+      if (analysis.negotiation_tactics?.pressure_tactics?.length > 0) {
+        response += `\n\n圧力戦術は通用しない。本気で交渉するなら誠実に話せ。`;
+      }
+      
+      if (analysis.negotiation_tactics?.emotional_appeal) {
+        response += `\n\n感情に訴えても価格は変わらない。ビジネスは論理で決まる。`;
+      }
+      
+      response += `\n\n提示価格: **¥${recommendedPrice.toLocaleString()}/月**`;
+      
+      if (analysis.next_question) {
+        response += `\n\n${analysis.next_question}`;
+      } else {
+        response += `\n\nこの価格で合意するか？\n合意なら「合意」と送れ。`;
+      }
+      
+      await client.replyMessage(event.replyToken, {
         type: 'text',
-        text: `提示は **¥${nextAmount.toLocaleString()}/月**。\n条件: ${conditionText}合意なら「合意」と送れ。`
-      };
-      await client.replyMessage(event.replyToken, buttons);
+        text: response
+      });
       return;
     }
 
