@@ -85,6 +85,147 @@ app.use(express.json());
 
 // ヘルパー関数
 
+// ====== Stripe/交渉 ヘルパー ======
+async function ensureStripeCustomer(profile) {
+  if (profile.stripe_customer_id) return profile.stripe_customer_id;
+  const customer = await stripe.customers.create({
+    name: profile.display_name || undefined,
+    metadata: { profile_id: profile.id, line_user_id: profile.line_user_id }
+  });
+  await supabase.from('profiles')
+    .update({ stripe_customer_id: customer.id })
+    .eq('id', profile.id);
+  return customer.id;
+}
+
+async function ensureUserSpecificPrice({ productId, profile, amountYen, interval='month' }) {
+  const lookup_key = `user_${profile.id}_${interval}_${amountYen}_jpy_v1`;
+
+  // 1) 検索（Search APIが無効でもlistでフォールバック）
+  try {
+    if (stripe.prices.search) {
+      const found = await stripe.prices.search({ query: `lookup_key:'${lookup_key}' AND active:'true'` });
+      if (found.data?.[0]) return found.data[0].id;
+    }
+  } catch (_) { /* ignore */ }
+
+  const list = await stripe.prices.list({ product: productId, active: true, limit: 100 });
+  const hit = list.data.find(p => p.lookup_key === lookup_key);
+  if (hit) return hit.id;
+
+  // 2) 無ければ作成
+  const price = await stripe.prices.create({
+    currency: 'jpy',
+    unit_amount: parseInt(amountYen, 10),
+    recurring: { interval },
+    product: productId,
+    nickname: `User ${profile.id} custom ¥${amountYen}/${interval}`,
+    lookup_key,
+    metadata: { user_id: profile.id, line_user_id: profile.line_user_id }
+  });
+  return price.id;
+}
+
+// 交渉セッションの取得/更新
+async function getOrCreateNegotiation(profile) {
+  const { data: sess } = await supabase
+    .from('negotiation_sessions')
+    .select('*')
+    .eq('user_id', profile.id)
+    .eq('state','open')
+    .order('created_at',{ ascending:false })
+    .limit(1)
+    .maybeSingle();
+
+  if (sess) return sess;
+
+  const anchor = parseInt(process.env.NEGOTIATION_ANCHOR_YEN || '49800', 10);
+  const floor  = parseInt(process.env.NEGOTIATION_FLOOR_YEN || '0', 10);
+
+  const { data: created } = await supabase
+    .from('negotiation_sessions')
+    .insert({
+      user_id: profile.id,
+      anchor_price: anchor,
+      floor_price: floor,
+      current_offer: anchor
+    })
+    .select()
+    .single();
+
+  return created;
+}
+
+async function updateNegotiation(id, patch) {
+  const { data } = await supabase
+    .from('negotiation_sessions')
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .select()
+    .single();
+  return data;
+}
+
+// OpenAIで交渉インテント抽出（自然言語→構造化）
+async function parseNegotiationIntent(text) {
+  const tools = [{
+    type: "function",
+    function: {
+      name: "negotiate_extract",
+      description: "交渉発話から要素抽出",
+      parameters: {
+        type: "object",
+        properties: {
+          budget: { type:"number", description:"希望月額(円)。なければnull" },
+          wants_yearly: { type:"boolean" },
+          student: { type:"boolean" },
+          will_post_on_x: { type:"boolean" },
+          accept: { type:"boolean", description:"この価格で合意か" },
+          reasons: { type:"array", items:{ type:"string" } }
+        }
+      }
+    }
+  }];
+
+  const sys = "あなたは価格交渉の抽出器。数値やYes/Noを厳密抽出。曖昧ならnull/false。";
+  const r = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role:"system", content: sys }, { role:"user", content: text }],
+    tools, tool_choice:{ type:"function", function:{ name:"negotiate_extract" } }
+  });
+
+  const call = r.choices?.[0]?.message?.tool_calls?.[0];
+  if (!call) return {};
+  return JSON.parse(call.function.arguments || "{}");
+}
+
+// 簡易ポリシー：希望等から次の提示額を決める
+function decideNextOffer(sess, facts) {
+  let score = sess.score || 0;
+  if (facts.student) score += 2;
+  if (facts.will_post_on_x) score += 2;
+  if (facts.wants_yearly) score += 1;
+  if (facts.reasons?.length > 0) score += 1;
+
+  const anchor = sess.anchor_price;
+  const floor  = sess.floor_price;
+
+  // 目安レンジ
+  let pct;
+  if (score >= 4)      pct = 0.2;  // 大幅
+  else if (score >= 2) pct = 0.4;  // 中程度
+  else                 pct = 0.6;  // 小幅
+
+  // 予算を主張していればそれも考慮
+  let target = Math.round(anchor * pct);
+  if (Number.isFinite(facts.budget)) target = Math.min(target, Math.max(floor, facts.budget|0));
+
+  // 下限を守る
+  target = Math.max(floor, target);
+
+  return { nextAmount: target, nextScore: score };
+}
+
 // ==== 共通ユーティリティ ====
 function roughTokens(s=''){ return Math.ceil((s||'').length / 3); }
 
@@ -1153,6 +1294,52 @@ async function handleEvent(event, ctx = {}) {
     }
     // ===== 新規ショートカット解析 終了 =====
 
+    // 交渉: "交渉" で開始／価格を言うと継続
+    if (/^(交渉|アップグレード交渉|値段|ねだん|価格)$/i.test(text)) {
+      const sess = await getOrCreateNegotiation(profile);
+      await client.replyMessage(event.replyToken, {
+        type:'text',
+        text: `標準は¥${sess.anchor_price.toLocaleString()}/月。だが交渉は歓迎だ。\n根拠を示せ。予算、学生、年払い、Xでレビュー投稿——何が出せる？`
+      });
+      return;
+    }
+
+    if (/^(合意|OK|オーケー|購入|それでいく)$/i.test(text)) {
+      // セッションがある前提で合意→決済URL
+      const sess = await getOrCreateNegotiation(profile);
+      const amount = sess.current_offer || sess.anchor_price;
+      const origin = sanitizeOrigin(ctx?.originFromReq) || buildSafeOrigin();
+      const u = new URL('/api/checkout/custom', origin);
+      u.searchParams.set('lineUserId', profile.line_user_id);
+      u.searchParams.set('amount', String(amount));
+      await client.replyMessage(event.replyToken, {
+        type:'text',
+        text:`**¥${amount.toLocaleString()}/月** で確定だ。支払いに進め。\n${u.toString()}`
+      });
+      await updateNegotiation(sess.id, { state:'agreed' });
+      return;
+    }
+
+    // 交渉の通常発話（値引き主張など）
+    if (/円|無料|ただ|年払い|学生|学割|X|Twitter|ツイッター|投稿|レビュー/i.test(text)) {
+      const sess = await getOrCreateNegotiation(profile);
+      const facts = await parseNegotiationIntent(text);
+      const { nextAmount, nextScore } = decideNextOffer(sess, facts);
+
+      await updateNegotiation(sess.id, {
+        score: nextScore,
+        current_offer: nextAmount,
+        meta: { ...(sess.meta||{}), facts }
+      });
+
+      const buttons = {
+        type: 'text',
+        text: `提示は **¥${nextAmount.toLocaleString()}/月**。条件: ${facts.wants_yearly?'年払いOK / ':''}${facts.will_post_on_x?'Xでレビュー投稿 / ':''}${facts.student?'学生証明 / ':''}合意なら「合意」と送れ。`
+      };
+      await client.replyMessage(event.replyToken, buttons);
+      return;
+    }
+
     // 既存の「完了:」「削除:」を先に処理
     if (text.startsWith('完了:') || text.startsWith('削除:')) {
       return await handleTaskOperation(event, profile, text);
@@ -1485,7 +1672,7 @@ async function handleAIChat(event, profile, text, ctx = {}) {
         u.searchParams.set('lineUserId', profile.line_user_id);
         return client.replyMessage(event.replyToken, { 
           type:'text', 
-          text:`プロプランにアップグレードできます。\n${u.toString()}` 
+          text:`プロプランにアップグレードできます。\n1) 通常購入: ${u.toString()}\n2) 価格を"交渉"したい場合は「交渉」と送ってください。`
         });
       }
       
@@ -1502,7 +1689,7 @@ async function handleAIChat(event, profile, text, ctx = {}) {
           u.searchParams.set('lineUserId', profile.line_user_id);
           return client.replyMessage(event.replyToken, { 
             type:'text', 
-            text:`プロプランにアップグレードできます。\n${u.toString()}` 
+            text:`プロプランにアップグレードできます。\n1) 通常購入: ${u.toString()}\n2) 価格を"交渉"したい場合は「交渉」と送ってください。` 
           });
         }
         
@@ -1514,7 +1701,7 @@ async function handleAIChat(event, profile, text, ctx = {}) {
         u.searchParams.set('lineUserId', profile.line_user_id);
         return client.replyMessage(event.replyToken, {
           type: 'text',
-          text: `プロプランにアップグレードできます。\n${u.toString()}`
+          text: `プロプランにアップグレードできます。\n1) 通常購入: ${u.toString()}\n2) 価格を"交渉"したい場合は「交渉」と送ってください。`
         });
       }
     } else if (!usageCheck.canUse && DISABLE_USAGE_LIMIT) {
@@ -2145,6 +2332,61 @@ app.get('/api/checkout', async (req, res) => {
         </body>
       </html>
     `);
+  }
+});
+
+// 交渉合意用：ユーザー専用PriceでCheckout
+app.get('/api/checkout/custom', async (req, res) => {
+  try {
+    const { lineUserId, amount } = req.query;
+    if (!lineUserId || !amount) return res.status(400).send('lineUserId and amount are required');
+
+    const amt = parseInt(String(amount), 10);
+    if (!Number.isFinite(amt) || amt < 0 || amt > 500000) {
+      return res.status(400).send('invalid amount');
+    }
+
+    // プロフィール
+    const { data: profile, error: e1 } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('line_user_id', lineUserId)
+      .single();
+    if (e1 || !profile) return res.status(404).send('Profile not found');
+
+    const customerId = await ensureStripeCustomer(profile);
+    const productId  = process.env.STRIPE_PRODUCT_ID;
+    if (!productId) return res.status(500).send('STRIPE_PRODUCT_ID missing');
+
+    // ユーザー専用Price
+    const priceId = await ensureUserSpecificPrice({
+      productId, profile, amountYen: amt, interval: 'month'
+    });
+
+    const origin = buildSafeOrigin();
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: priceId, quantity: 1 }],
+      allow_promotion_codes: false, // 交渉額を固定したいならfalse
+      success_url: new URL(`/success?session_id={CHECKOUT_SESSION_ID}`, origin).toString(),
+      cancel_url: new URL('/cancel', origin).toString(),
+      metadata: {
+        line_user_id: lineUserId,
+        profile_id: profile.id,
+        negotiated_amount: amt
+      }
+    });
+
+    // profilesのcurrent_price_idを保持（任意）
+    await supabase.from('profiles')
+      .update({ current_price_id: priceId, updated_at: new Date().toISOString() })
+      .eq('id', profile.id);
+
+    return res.redirect(session.url);
+  } catch (err) {
+    console.error('/api/checkout/custom error', err);
+    return res.status(500).send('Failed to create custom checkout');
   }
 });
 
