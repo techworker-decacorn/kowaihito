@@ -336,7 +336,7 @@ function normalizeNegotiationSession(row) {
     steps,
     step_index: stepIndex,
     floor_yen: floor,
-    current_offer_yen: row.current_offer_yen ?? row.current_offer ?? row.anchor_price ?? null,
+    current_offer_yen: row.current_offer ?? row.anchor_price ?? null,
     reason_class: row.reason_class ?? meta.reason_class ?? null,
     meta
   };
@@ -537,7 +537,7 @@ async function buildCheckoutUrl(profile, session, originHint) {
   const origin = sanitizeOrigin(originHint) || buildSafeOrigin();
   const url = new URL('/api/checkout/custom', origin);
   url.searchParams.set('lineUserId', profile.line_user_id);
-  url.searchParams.set('amount', String(session.current_offer_yen));
+  url.searchParams.set('amount', String(session.current_offer));
   return url.toString();
 }
 
@@ -624,7 +624,7 @@ async function handleNegotiationFlow({ event, profile, text, origin }) {
       await saveContext(profile.id, { current_session_id: session.id });
 
       const roast = await buildRoast(profile.id);
-      const message = `${roast}\n\n初月は**¥${Number(session.current_offer_yen).toLocaleString()}**で始める。いけるか？（はい / いいえ / もう少し）`;
+      const message = `${roast}\n\n初月は**¥${Number(session.current_offer).toLocaleString()}**で始める。いけるか？（はい / いいえ / もう少し）`;
 
       await appendNegotiationHistory(session.id, [
         { role: 'bot', content: roast }
@@ -652,7 +652,7 @@ async function handleNegotiationFlow({ event, profile, text, origin }) {
           {
             state: 'agreed',
             accepted: true,
-            final_price: session.current_offer_yen,
+            final_price: session.current_offer,
             completed_at: new Date().toISOString()
           },
           {
@@ -666,7 +666,7 @@ async function handleNegotiationFlow({ event, profile, text, origin }) {
 
         const checkoutUrl = await buildCheckoutUrl(profile, updated, origin);
         await saveState(profile.id, 'close');
-        const acceptanceMessage = `合意だ。**¥${Number(updated.current_offer_yen).toLocaleString()}**で決裁しろ。\n\n決済後は全ての機能が使えるようになる。\n\n🔗 ${checkoutUrl}\n\nリンクが切れたらまた知らせろ。`;
+        const acceptanceMessage = `合意だ。**¥${Number(updated.current_offer).toLocaleString()}**で決裁しろ。\n\n決済後は全ての機能が使えるようになる。\n\n🔗 ${checkoutUrl}\n\nリンクが切れたらまた知らせろ。`;
         await replyText(event, acceptanceMessage);
         await appendNegotiationHistory(updated.id, [{ role: 'bot', content: acceptanceMessage }]);
         return true;
@@ -676,7 +676,7 @@ async function handleNegotiationFlow({ event, profile, text, origin }) {
       await saveContext(profile.id, { constraint_reason: classification });
 
       const next = computeNextOffer(session, classification);
-      const newOffer = next.offer ?? session.current_offer_yen;
+      const newOffer = next.offer ?? session.current_offer;
       const nextIndex = typeof next.nextIndex === 'number' ? next.nextIndex : session.step_index;
 
       const updatedSession = await updateNegotiationSession(
@@ -697,11 +697,11 @@ async function handleNegotiationFlow({ event, profile, text, origin }) {
 
       let response;
       if (!next.concede) {
-        response = `了解。じゃあ今の**¥${Number(updatedSession.current_offer_yen).toLocaleString()}**でどうだ？（合意 / もっと）`;
+        response = `了解。じゃあ今の**¥${Number(updatedSession.current_offer).toLocaleString()}**でどうだ？（合意 / もっと）`;
       } else if (next.reachedFloor) {
-        response = `これが最終だ。**¥${Number(updatedSession.current_offer_yen).toLocaleString()}**。機能制限ありでも受けるか？（はい / やめる）`;
+        response = `これが最終だ。**¥${Number(updatedSession.current_offer).toLocaleString()}**。機能制限ありでも受けるか？（はい / やめる）`;
       } else {
-        response = `理由は理解した。なら**¥${Number(updatedSession.current_offer_yen).toLocaleString()}**で手を打つ。どうする？（合意 / もう少し）`;
+        response = `理由は理解した。なら**¥${Number(updatedSession.current_offer).toLocaleString()}**で手を打つ。どうする？（合意 / もう少し）`;
       }
 
       await replyText(event, response);
