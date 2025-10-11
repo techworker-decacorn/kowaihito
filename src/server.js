@@ -180,7 +180,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE
 );
 
-const NEGOTIATION_START_REGEX = /^(交渉|アップグレード交渉|値段|ねだん|価格|値下げ|安く|安い|割引|ディスカウント|値引き|価格交渉|料金|料金交渉|値段交渉|値段相談|価格相談|料金相談|はじめる)$/i;
+const NEGOTIATION_START_REGEX = /^(交渉|アップグレード交渉|値段|ねだん|価格|値下げ|安く|安い|割引|ディスカウント|値引き|価格交渉|料金|料金交渉|値段交渉|値段相談|価格相談|料金相談|はじめる|話し合い|相談|決めよう|プロプラン|アップグレード|移行|使いたい|もっと|続けたい)$/i;
 const ACCEPT_REGEX = /^(はい|ok|ｏｋ|了解|りょうかい|合意|それで|決めた|買う)([!！。ですます〜\s]*)?$/i;
 const DECLINE_REGEX = /^(やめる|キャンセル|キャンセルする|中止|終了|交渉終了|いらない|不要)([!！。ですます〜\s]*)?$/i;
 
@@ -188,7 +188,7 @@ const STATE_PROMPTS = Object.freeze({
   onboarding_q1: 'こわい上司だ。なぜ私を必要としたのかを答えろ。',
   onboarding_q2: '立場は？（学生 / 個人プロ / チーム）',
   onboarding_q3: '月の予算の上限は？（数字だけでもいい）',
-  close: 'もう一度始めるなら「交渉」と送れ。'
+  close: '交渉は終了した。また話し合いたいなら何かメッセージを送れ。'
 });
 
 const LADDERS = Object.freeze({
@@ -573,7 +573,11 @@ async function handleNegotiationFlow({ event, profile, text, origin }) {
     return true;
   }
 
-  if (state === 'close' && NEGOTIATION_START_REGEX.test(trimmed)) {
+  // 交渉完了後の再開（より自然な条件）
+  if (state === 'close' && (
+    NEGOTIATION_START_REGEX.test(trimmed) || 
+    /(価格|値段|料金|安く|割引|交渉|話し合い|相談|決めよう|プロプラン|アップグレード|移行|使いたい|もっと|続けたい)/i.test(trimmed)
+  )) {
     await saveContext(profile.id, {
       last_state: 'onboarding_q1',
       current_session_id: null,
@@ -2899,14 +2903,11 @@ async function handleAIChat(event, profile, text, ctx = {}) {
     if (!usageCheck.canUse && !DISABLE_USAGE_LIMIT) {
       console.log('Usage limit reached, showing upgrade message');
       
-      // 強制テキストモードのチェック（緊急対応）
+      // 自然な交渉誘導
       if (process.env.FORCE_TEXT_UPGRADE === '1' || true) { // 一時的に常に有効
-        const origin = sanitizeOrigin(ctx?.originFromReq) || buildSafeOrigin();
-        const u = new URL('/api/checkout', origin); 
-        u.searchParams.set('lineUserId', profile.line_user_id);
         return client.replyMessage(event.replyToken, { 
           type:'text', 
-          text:`プロプランにアップグレードできます。\n1) 通常購入: ${u.toString()}\n2) 価格を"交渉"したい場合は「交渉」と送ってください。`
+          text:`今日の無料枠を使い切った。\n\nもっと使いたいなら、プロプランに移行しろ。\n\n価格は話し合いで決めよう。`
         });
       }
       
@@ -2918,24 +2919,18 @@ async function handleAIChat(event, profile, text, ctx = {}) {
         if (!v.ok) {
           // 失敗理由をログ & テキストにフォールバック（絶対に無言にしない）
           console.error('LINE validation failed:', v.error);
-          const origin = sanitizeOrigin(ctx?.originFromReq) || buildSafeOrigin();
-          const u = new URL('/api/checkout', origin); 
-          u.searchParams.set('lineUserId', profile.line_user_id);
           return client.replyMessage(event.replyToken, { 
             type:'text', 
-            text:`プロプランにアップグレードできます。\n1) 通常購入: ${u.toString()}\n2) 価格を"交渉"したい場合は「交渉」と送ってください。` 
+            text:`今日の無料枠を使い切った。\n\nもっと使いたいなら、プロプランに移行しろ。\n\n価格は話し合いで決めよう。` 
           });
         }
         
         return client.replyMessage(event.replyToken, flex);
       } catch (e) {
         console.error('Upgrade Flex build failed:', e?.message);
-        const origin = sanitizeOrigin(ctx?.originFromReq) || buildSafeOrigin();
-        const u = new URL('/api/checkout', origin); 
-        u.searchParams.set('lineUserId', profile.line_user_id);
         return client.replyMessage(event.replyToken, {
           type: 'text',
-          text: `プロプランにアップグレードできます。\n1) 通常購入: ${u.toString()}\n2) 価格を"交渉"したい場合は「交渉」と送ってください。`
+          text: `今日の無料枠を使い切った。\n\nもっと使いたいなら、プロプランに移行しろ。\n\n価格は話し合いで決めよう。`
         });
       }
     } else if (!usageCheck.canUse && DISABLE_USAGE_LIMIT) {
