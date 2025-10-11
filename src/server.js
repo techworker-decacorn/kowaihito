@@ -2191,6 +2191,124 @@ app.post('/webhook', (req, res) => {
   }
 });
 
+// 汎用Webhookエンドポイント
+app.post('/webhook/generic', (req, res) => {
+  try {
+    console.log('=== Generic Webhook Received ===');
+    console.log('Headers:', req.headers);
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+    console.log('Query:', req.query);
+    console.log('Method:', req.method);
+    console.log('URL:', req.url);
+    
+    // 基本的なレスポンス
+    const response = {
+      success: true,
+      timestamp: new Date().toISOString(),
+      received: {
+        headers: req.headers,
+        body: req.body,
+        query: req.query,
+        method: req.method,
+        url: req.url
+      }
+    };
+    
+    console.log('Webhook processed successfully');
+    res.status(200).json(response);
+  } catch (error) {
+    console.error('Generic webhook error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Stripe Webhookエンドポイント
+app.post('/webhook/stripe', express.raw({type: 'application/json'}), (req, res) => {
+  try {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    
+    let event;
+    
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+      console.log(`Webhook signature verification failed.`, err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+    
+    console.log('=== Stripe Webhook Received ===');
+    console.log('Event type:', event.type);
+    console.log('Event ID:', event.id);
+    
+    // イベントタイプに応じた処理
+    switch (event.type) {
+      case 'checkout.session.completed':
+        console.log('Checkout session completed:', event.data.object);
+        // ここでサブスクリプション処理などを行う
+        break;
+      case 'customer.subscription.created':
+        console.log('Subscription created:', event.data.object);
+        break;
+      case 'customer.subscription.updated':
+        console.log('Subscription updated:', event.data.object);
+        break;
+      case 'customer.subscription.deleted':
+        console.log('Subscription deleted:', event.data.object);
+        break;
+      default:
+        console.log(`Unhandled event type ${event.type}`);
+    }
+    
+    res.json({received: true});
+  } catch (error) {
+    console.error('Stripe webhook error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// GitHub Webhookエンドポイント
+app.post('/webhook/github', (req, res) => {
+  try {
+    console.log('=== GitHub Webhook Received ===');
+    console.log('Event:', req.headers['x-github-event']);
+    console.log('Delivery:', req.headers['x-github-delivery']);
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+    
+    const event = req.headers['x-github-event'];
+    
+    switch (event) {
+      case 'push':
+        console.log('Push event received');
+        // デプロイ処理など
+        break;
+      case 'pull_request':
+        console.log('Pull request event received');
+        break;
+      case 'issues':
+        console.log('Issues event received');
+        break;
+      default:
+        console.log(`Unhandled GitHub event: ${event}`);
+    }
+    
+    res.status(200).json({received: true});
+  } catch (error) {
+    console.error('GitHub webhook error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // イベントハンドラー
 async function handleEvent(event, ctx = {}) {
   console.log('=== handleEvent called ===');
