@@ -213,17 +213,29 @@ app.use(express.json());
 
 // ===== Negotiation state/context helpers =====
 async function getProfileContext(userId) {
+  // profile_memoriesテーブルからcontextデータを取得
   const { data, error } = await supabase
-    .from('profile_context')
+    .from('profile_memories')
     .select('*')
     .eq('user_id', userId)
+    .eq('key', 'context')
     .maybeSingle();
 
   if (error && error.code !== 'PGRST116') {
     console.error('[profile_context] fetch error:', error);
     throw error;
   }
-  return data || null;
+  
+  // context_dataをパースして返す
+  if (data && data.value) {
+    try {
+      return JSON.parse(data.value);
+    } catch (e) {
+      console.error('[profile_context] JSON parse error:', e);
+      return null;
+    }
+  }
+  return null;
 }
 
 async function saveContext(userId, patch = {}) {
@@ -231,13 +243,19 @@ async function saveContext(userId, patch = {}) {
   const merged = {
     ...(current || {}),
     ...patch,
-    user_id: userId,
     updated_at: new Date().toISOString()
   };
 
+  // profile_memoriesテーブルにcontextデータを保存
   const { data, error } = await supabase
-    .from('profile_context')
-    .upsert(merged, { onConflict: 'user_id' })
+    .from('profile_memories')
+    .upsert({
+      user_id: userId,
+      key: 'context',
+      value: JSON.stringify(merged),
+      category: 'context',
+      weight: 1
+    }, { onConflict: 'user_id,key' })
     .select()
     .single();
 
@@ -245,7 +263,7 @@ async function saveContext(userId, patch = {}) {
     console.error('[profile_context] upsert error:', error);
     throw error;
   }
-  return data;
+  return merged;
 }
 
 async function getState(userId) {
