@@ -2401,6 +2401,40 @@ async function handleEvent(event, ctx = {}) {
   console.log('Event type:', event.type);
   console.log('Message type:', event.message?.type);
   
+  // フォローイベントの処理（新規登録時）
+  if (event.type === 'follow') {
+    console.log('=== Follow Event Received ===');
+    const lineUserId = event.source.userId;
+    const displayName = event.source.type === 'user' ? 'User' : 'Unknown';
+    
+    // プロフィールを確保
+    const profile = await ensureProfile(lineUserId, displayName);
+    if (!profile) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'プロフィールの作成に失敗しました。しばらく時間をおいてから再度お試しください。'
+      });
+    }
+    
+    // 交渉フローを自動開始
+    await saveContext(profile.id, {
+      last_state: 'onboarding_q1',
+      purpose: null,
+      role: null,
+      budget_yen: null,
+      constraint_reason: null,
+      current_session_id: null
+    });
+    
+    // オンボーディング開始メッセージ
+    const welcomeMessage = `ようこそ、サボれない世界へ。\n\n"超厳しいAI指導官"が、あなたのタスクが終わるまで監視する。\n\n${STATE_PROMPTS.onboarding_q1}`;
+    
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: welcomeMessage
+    });
+  }
+  
   // postbackイベントの処理
   if (event.type === 'postback') {
     const lineUserId = event.source.userId;
