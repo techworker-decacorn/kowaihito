@@ -129,6 +129,29 @@ app.get('/debug/upgrade-selftest', (req, res) => {
   }
 });
 
+// デバッグ用：LINE Bot設定確認
+app.get('/debug/line', (req, res) => {
+  try {
+    res.json({
+      channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN ? 'SET' : 'NOT_SET',
+      channelSecret: process.env.LINE_CHANNEL_SECRET ? 'SET' : 'NOT_SET',
+      channelAccessTokenLength: process.env.LINE_CHANNEL_ACCESS_TOKEN?.length || 0,
+      channelSecretLength: process.env.LINE_CHANNEL_SECRET?.length || 0,
+      config: {
+        channelAccessToken: config.channelAccessToken ? 'SET' : 'NOT_SET',
+        channelSecret: config.channelSecret ? 'SET' : 'NOT_SET'
+      },
+      clientInitialized: !!client,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error.message,
+      stack: error.stack
+    });
+  }
+});
+
 // LINE Bot設定
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -2153,7 +2176,30 @@ function createSubscriptionFlexMessage(lineUserId, originFromReq) {
 
 // Webhookエンドポイント
 app.post('/webhook', (req, res) => {
+  console.log('=== LINE Webhook Received ===');
+  console.log('Headers:', req.headers);
+  console.log('Body type:', typeof req.body);
+  console.log('Body:', JSON.stringify(req.body, null, 2));
+  
   try {
+    // 基本的なバリデーション
+    if (!req.body) {
+      console.error('No body received');
+      return res.status(400).json({ 
+        error: 'No body received',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    if (!req.body.events || !Array.isArray(req.body.events)) {
+      console.error('Invalid events format:', req.body);
+      return res.status(400).json({ 
+        error: 'Invalid events format',
+        received: req.body,
+        timestamp: new Date().toISOString()
+      });
+    }
+
     // 署名検証（Vercel用に調整）
     const signature = req.get('X-Line-Signature');
     const body = req.body;
@@ -2164,9 +2210,8 @@ app.post('/webhook', (req, res) => {
     //   return res.status(401).send('Unauthorized');
     // }
 
-    // リクエストボディは既にパース済み
-    console.log('Received webhook:', JSON.stringify(req.body, null, 2));
     console.log('Destination:', req.body.destination);
+    console.log('Events count:', req.body.events.length);
     
     // 受信リクエストから安全なoriginを生成
     const originFromReq = (() => {
@@ -2175,19 +2220,42 @@ app.post('/webhook', (req, res) => {
       return `${proto}://${host}`;
     })();
     
+    console.log('Origin from request:', originFromReq);
+    
+    // 各イベントを処理
     Promise
-      .all(req.body.events.map(ev => handleEvent(ev, { originFromReq })))
+      .all(req.body.events.map((ev, index) => {
+        console.log(`Processing event ${index + 1}/${req.body.events.length}:`, ev.type);
+        return handleEvent(ev, { originFromReq });
+      }))
       .then((result) => {
-        console.log('Webhook processed successfully');
-        res.json(result);
+        console.log('Webhook processed successfully, results:', result);
+        res.json({ 
+          success: true, 
+          processed: result.length,
+          results: result,
+          timestamp: new Date().toISOString()
+        });
       })
       .catch((err) => {
         console.error('Event handling error:', err);
-        res.status(500).end();
+        console.error('Error stack:', err.stack);
+        res.status(500).json({
+          error: 'Event handling failed',
+          message: err.message,
+          stack: err.stack,
+          timestamp: new Date().toISOString()
+        });
       });
   } catch (error) {
     console.error('Webhook error:', error);
-    res.status(500).end();
+    console.error('Error stack:', error.stack);
+    res.status(500).json({
+      error: 'Webhook processing failed',
+      message: error.message,
+      stack: error.stack,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
