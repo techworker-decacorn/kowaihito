@@ -666,7 +666,7 @@ async function handleNegotiationFlow({ event, profile, text, origin }) {
 
         const checkoutUrl = await buildCheckoutUrl(profile, updated, origin);
         await saveState(profile.id, 'close');
-        const acceptanceMessage = `合意だ。**¥${Number(updated.current_offer_yen).toLocaleString()}**で決裁しろ。\n\n🔗 ${checkoutUrl}\n\nリンクが切れたらまた知らせろ。`;
+        const acceptanceMessage = `合意だ。**¥${Number(updated.current_offer_yen).toLocaleString()}**で決裁しろ。\n\n決済後は全ての機能が使えるようになる。\n\n🔗 ${checkoutUrl}\n\nリンクが切れたらまた知らせろ。`;
         await replyText(event, acceptanceMessage);
         await appendNegotiationHistory(updated.id, [{ role: 'bot', content: acceptanceMessage }]);
         return true;
@@ -1545,6 +1545,19 @@ async function hasActiveNegotiation(userId) {
   // 24時間以内のセッションのみ有効
   const sessionAge = dayjs().diff(dayjs(session.created_at), 'hours');
   return sessionAge < 24;
+}
+
+async function hasCompletedNegotiation(userId) {
+  const { data: session } = await supabase
+    .from('negotiation_sessions')
+    .select('id, state, created_at')
+    .eq('user_id', userId)
+    .eq('state', 'agreed')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  
+  return !!session;
 }
 
 async function checkUsageLimit(userId) {
@@ -2430,8 +2443,8 @@ async function handleEvent(event, ctx = {}) {
       current_session_id: null
     });
     
-    // オンボーディング開始メッセージ
-    const welcomeMessage = `ようこそ、サボれない世界へ。\n\n"超厳しいAI指導官"が、あなたのタスクが終わるまで監視する。\n\n${STATE_PROMPTS.onboarding_q1}`;
+    // 交渉開始メッセージ
+    const welcomeMessage = `ようこそ、サボれない世界へ。\n\n"超厳しいAI指導官"が、あなたのタスクが終わるまで監視する。\n\nまずは価格を話し合おう。\n\n${STATE_PROMPTS.onboarding_q1}`;
     
     return client.replyMessage(event.replyToken, {
       type: 'text',
@@ -2892,59 +2905,54 @@ async function handleAIChat(event, profile, text, ctx = {}) {
   console.log('=== handleAIChat called ===');
   console.log('Profile subscription status:', profile.subscription_status);
   
-  // 利用制限チェック（タスク系メッセージは除外）
-  if (profile.subscription_status === 'free') {
-    console.log('Checking usage limit for free user...');
-    const usageCheck = await checkUsageLimit(profile.id);
-    console.log('Usage check result:', usageCheck);
-    
-    // 一時的に利用制限を無効化（デバッグ用）
-    const DISABLE_USAGE_LIMIT = false; // 利用制限を有効化
-    if (!usageCheck.canUse && !DISABLE_USAGE_LIMIT) {
-      console.log('Usage limit reached, showing upgrade message');
+  // 決済リンク再取得の処理
+  if (/(決済|リンク|切れた|再取得)/i.test(text)) {
+    const hasCompletedNegotiation = await hasCompletedNegotiation(profile.id);
+    if (hasCompletedNegotiation && profile.subscription_status === 'free') {
+      // 最新の交渉セッションを取得
+      const { data: session } = await supabase
+        .from('negotiation_sessions')
+        .select('*')
+        .eq('user_id', profile.id)
+        .eq('state', 'agreed')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
       
-      // 自然な交渉誘導
-      if (process.env.FORCE_TEXT_UPGRADE === '1' || true) { // 一時的に常に有効
+      if (session) {
+        const checkoutUrl = await buildCheckoutUrl(profile, session, ctx?.originFromReq);
         return client.replyMessage(event.replyToken, { 
           type:'text', 
-          text:`今日の無料枠を使い切った。\n\nもっと使いたいなら、プロプランに移行しろ。\n\n価格は話し合いで決めよう。`
+          text:`決済リンクを再発行した。\n\n🔗 ${checkoutUrl}\n\n決済後は全ての機能が使えるようになる。`
         });
       }
-      
-      try {
-        const flex = createSubscriptionFlexMessage(profile.line_user_id, ctx.originFromReq);
-        
-        // LINEのバリデーションAPIで事前検証
-        const v = await validateLineReply(flex);
-        if (!v.ok) {
-          // 失敗理由をログ & テキストにフォールバック（絶対に無言にしない）
-          console.error('LINE validation failed:', v.error);
-          return client.replyMessage(event.replyToken, { 
-            type:'text', 
-            text:`今日の無料枠を使い切った。\n\nもっと使いたいなら、プロプランに移行しろ。\n\n価格は話し合いで決めよう。` 
-          });
-        }
-        
-        return client.replyMessage(event.replyToken, flex);
-      } catch (e) {
-        console.error('Upgrade Flex build failed:', e?.message);
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: `今日の無料枠を使い切った。\n\nもっと使いたいなら、プロプランに移行しろ。\n\n価格は話し合いで決めよう。`
-        });
-      }
-    } else if (!usageCheck.canUse && DISABLE_USAGE_LIMIT) {
-      console.log('Usage limit reached but disabled for debugging');
     }
-    
-    // ← このチャットが「無料枠の最後の1回」かどうかを保持
-    var isLastFreeBeforeIncrement = (usageCheck.remaining === 1);
-    console.log('isLastFreeBeforeIncrement:', isLastFreeBeforeIncrement);
+  }
+
+  // 交渉状態のチェック（無料枠の概念を削除）
+  const isNegotiating = await hasActiveNegotiation(profile.id);
+  const hasCompletedNegotiation = await hasCompletedNegotiation(profile.id);
+  
+  // 交渉未完了の場合は交渉を促す
+  if (profile.subscription_status === 'free' && !isNegotiating && !hasCompletedNegotiation) {
+    console.log('User has not started negotiation, prompting for negotiation');
+    return client.replyMessage(event.replyToken, { 
+      type:'text', 
+      text:`まずは価格を話し合おう。\n\nなぜ私を必要としたのかを答えろ。`
+    });
+  }
+  
+  // 交渉完了済みだが課金していない場合は決済を促す
+  if (profile.subscription_status === 'free' && hasCompletedNegotiation && !isNegotiating) {
+    console.log('User completed negotiation but not paid, prompting for payment');
+    return client.replyMessage(event.replyToken, { 
+      type:'text', 
+      text:`交渉は完了した。決済してから機能を使えるようになる。\n\n決済リンクが切れたら「決済」と送れ。`
+    });
   }
 
   // 人格切替機能
   const isPro = profile.subscription_status === 'pro';
-  const isNegotiating = await hasActiveNegotiation(profile.id);
   
   const systemPrompt = isNegotiating
     ? `You are The Bouncer. 人間っぽく短く、時に小突く。侮辱や差別は絶対にしない。価格交渉のための聞き取りを優先し、数字を引き出す。内部のフロア/ルールは絶対に開示しない。合意時は"合意"と言わせて決済リンクに送る。`
