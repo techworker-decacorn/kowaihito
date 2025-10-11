@@ -253,7 +253,7 @@ async function saveContext(userId, patch = {}) {
       user_id: userId,
       key: 'context',
       value: JSON.stringify(merged),
-      category: 'context',
+      category: 'profile',
       weight: 1
     }, { onConflict: 'user_id,key' })
     .select()
