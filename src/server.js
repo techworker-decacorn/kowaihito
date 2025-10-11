@@ -43,6 +43,92 @@ app.get('/debug/legal', (req, res) => {
   });
 });
 
+// デバッグ用：交渉セッション確認
+app.get('/debug/negotiation', async (req, res) => {
+  try {
+    const { data: sessions, error } = await supabase
+      .from('negotiation_sessions')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(10);
+    
+    if (error) {
+      return res.json({ error: error.message, sessions: null });
+    }
+    
+    res.json({ 
+      sessions,
+      count: sessions?.length || 0,
+      error: null 
+    });
+  } catch (err) {
+    res.json({ error: err.message, sessions: null });
+  }
+});
+
+// デバッグ用：交渉セッションリセット
+app.get('/debug/reset-negotiation', async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('negotiation_sessions')
+      .update({ state: 'cancelled' })
+      .eq('state', 'open');
+    
+    if (error) {
+      return res.json({ error: error.message });
+    }
+    
+    res.json({ 
+      success: true,
+      message: 'All open negotiation sessions have been cancelled'
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// デバッグ用：環境変数確認
+app.get('/debug/env', (req, res) => {
+  const stripeKey = process.env.STRIPE_SECRET_KEY;
+  const stripeKeyHasNewline = stripeKey?.includes('\n') || stripeKey?.includes('\r');
+  const stripeKeyCharCodes = stripeKey ? stripeKey.split('').map(c => c.charCodeAt(0)) : null;
+  
+  res.json({
+    STRIPE_PRODUCT_ID: process.env.STRIPE_PRODUCT_ID ? 'SET' : 'NOT_SET',
+    STRIPE_SECRET_KEY: stripeKey ? 'SET' : 'NOT_SET',
+    stripeKeyHasNewline,
+    stripeKeyCharCodes: stripeKeyCharCodes?.slice(0, 10), // 最初の10文字の文字コード
+    NEGOTIATION_ANCHOR_YEN: process.env.NEGOTIATION_ANCHOR_YEN || '49800',
+    NEGOTIATION_FLOOR_YEN: process.env.NEGOTIATION_FLOOR_YEN || '0',
+    NEGOTIATION_LIST_PRICE_YEN: process.env.NEGOTIATION_LIST_PRICE_YEN,
+    NEGOTIATION_SOFT_FLOOR_YEN: process.env.NEGOTIATION_SOFT_FLOOR_YEN,
+    NEGOTIATION_HARD_FLOOR_YEN: process.env.NEGOTIATION_HARD_FLOOR_YEN,
+    NEGOTIATION_MAX_CONCESSIONS: process.env.NEGOTIATION_MAX_CONCESSIONS,
+    NEGOTIATION_ANCHOR_VARIANCE_PCT: process.env.NEGOTIATION_ANCHOR_VARIANCE_PCT,
+    CHECKOUT_BASE_URL: process.env.CHECKOUT_BASE_URL,
+    VERCEL_URL: process.env.VERCEL_URL
+  });
+});
+
+// デバッグ用：アップグレードセルフテスト
+app.get('/debug/upgrade-selftest', (req, res) => {
+  try {
+    const origin = buildSafeOrigin();
+    const testUrl = new URL('/api/checkout', origin);
+    testUrl.searchParams.set('lineUserId', 'test_user');
+    
+    res.json({
+      buildSafeOrigin: origin,
+      testCheckoutUrl: testUrl.toString(),
+      sanitizeOrigin: sanitizeOrigin(req.get('origin')),
+      userAgent: req.get('user-agent'),
+      host: req.get('host')
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 // LINE Bot設定
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -71,6 +157,23 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE
 );
 
+const NEGOTIATION_START_REGEX = /^(交渉|アップグレード交渉|値段|ねだん|価格|値下げ|安く|安い|割引|ディスカウント|値引き|価格交渉|料金|料金交渉|値段交渉|値段相談|価格相談|料金相談|はじめる)$/i;
+const ACCEPT_REGEX = /^(はい|ok|ｏｋ|了解|りょうかい|合意|それで|決めた|買う)([!！。ですます〜\s]*)?$/i;
+const DECLINE_REGEX = /^(やめる|キャンセル|キャンセルする|中止|終了|交渉終了|いらない|不要)([!！。ですます〜\s]*)?$/i;
+
+const STATE_PROMPTS = Object.freeze({
+  onboarding_q1: 'こわい上司だ。なぜ私を必要としたのかを答えろ。',
+  onboarding_q2: '立場は？（学生 / 個人プロ / チーム）',
+  onboarding_q3: '月の予算の上限は？（数字だけでもいい）',
+  close: 'もう一度始めるなら「交渉」と送れ。'
+});
+
+const LADDERS = Object.freeze({
+  student: { anchor: 3000, steps: [2900, 2500, 2000, 1000, 500, 300], floor: 300 },
+  indie:   { anchor: 4900, steps: [3900, 3500, 2900, 2500], floor: 2500 },
+  team:    { anchor: 9900, steps: [7900, 5900], floor: 5900 }
+});
+
 // Stripe設定
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -85,6 +188,496 @@ app.use(express.json());
 
 // ヘルパー関数
 
+// ===== Negotiation state/context helpers =====
+async function getProfileContext(userId) {
+  const { data, error } = await supabase
+    .from('profile_context')
+    .select('*')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error && error.code !== 'PGRST116') {
+    console.error('[profile_context] fetch error:', error);
+    throw error;
+  }
+  return data || null;
+}
+
+async function saveContext(userId, patch = {}) {
+  const current = await getProfileContext(userId);
+  const merged = {
+    ...(current || {}),
+    ...patch,
+    user_id: userId,
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase
+    .from('profile_context')
+    .upsert(merged, { onConflict: 'user_id' })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('[profile_context] upsert error:', error);
+    throw error;
+  }
+  return data;
+}
+
+async function getState(userId) {
+  const ctx = await getProfileContext(userId);
+  return ctx?.last_state || null;
+}
+
+async function saveState(userId, state) {
+  return saveContext(userId, { last_state: state });
+}
+
+async function resetNegotiationContext(userId) {
+  return saveContext(userId, {
+    last_state: null,
+    purpose: null,
+    role: null,
+    budget_yen: null,
+    constraint_reason: null,
+    current_session_id: null
+  });
+}
+
+function classifyRole(text = '') {
+  const t = text.toLowerCase();
+  if (t.includes('学生') || t.includes('student') || t.includes('school')) return 'student';
+  if (t.includes('チーム') || t.includes('team') || t.includes('会社') || t.includes('corporate')) return 'team';
+  return 'indie';
+}
+
+function extractBudgetAndReason(text = '') {
+  const normalized = text.replace(/[,\s円¥]/g, '');
+  const match = normalized.match(/(\d{3,6})/);
+  const budgetYen = match ? parseInt(match[1], 10) : null;
+
+  const lower = text.toLowerCase();
+  let reason = null;
+  if (lower.includes('学生') || lower.includes('student')) reason = 'student';
+  else if (lower.includes('予算') || lower.includes('高い') || lower.includes('無理') || lower.includes('budget')) reason = 'budget';
+  else if (lower.includes('使い方') || lower.includes('用途') || lower.includes('どう使')) reason = 'usecase-unclear';
+
+  return { budgetYen, reason };
+}
+
+async function decideSegment(userId) {
+  const ctx = await getProfileContext(userId);
+  if (!ctx) return 'indie';
+  if (ctx.role === 'team') return 'team';
+  if (ctx.role === 'student') return 'student';
+  if (ctx.budget_yen && ctx.budget_yen <= 1000) return 'student';
+  return 'indie';
+}
+
+function normalizeNegotiationSession(row) {
+  if (!row) return null;
+  const meta = row.meta || {};
+  const steps = row.steps || meta.steps || [];
+  const stepIndex = typeof row.step_index === 'number'
+    ? row.step_index
+    : (typeof meta.step_index === 'number' ? meta.step_index : -1);
+
+  const floor = meta.floor_yen ?? row.floor_yen ?? row.soft_floor ?? 0;
+  const segment = row.segment || meta.segment || null;
+
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    state: row.state,
+    segment,
+    anchor_yen: row.anchor_yen ?? row.anchor_price ?? meta.anchor_yen ?? null,
+    steps,
+    step_index: stepIndex,
+    floor_yen: floor,
+    current_offer_yen: row.current_offer_yen ?? row.current_offer ?? row.anchor_price ?? null,
+    reason_class: row.reason_class ?? meta.reason_class ?? null,
+    meta
+  };
+}
+
+async function createNegoSession(userId, segment, ladder) {
+  const payload = {
+    user_id: userId,
+    state: 'open',
+    segment,
+    anchor_price: ladder.anchor,
+    soft_floor: ladder.floor,
+    hard_floor: ladder.floor,
+    current_offer: ladder.anchor,
+    concessions_used: 0,
+    meta: {
+      segment,
+      steps: ladder.steps,
+      step_index: -1,
+      floor_yen: ladder.floor,
+      reason_class: null,
+      conversation_history: []
+    }
+  };
+
+  const { data, error } = await supabase
+    .from('negotiation_sessions')
+    .insert(payload)
+    .select()
+    .single();
+
+  if (error) {
+    console.error('[negotiation_sessions] insert error:', error);
+    throw error;
+  }
+
+  return normalizeNegotiationSession(data);
+}
+
+async function getActiveNegotiationSession(userId) {
+  const { data, error } = await supabase
+    .from('negotiation_sessions')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('state', 'open')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error && error.code !== 'PGRST116') {
+    console.error('[negotiation_sessions] fetch active error:', error);
+    throw error;
+  }
+
+  return normalizeNegotiationSession(data);
+}
+
+async function getNegotiationSessionById(id) {
+  const { data, error } = await supabase
+    .from('negotiation_sessions')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error && error.code !== 'PGRST116') {
+    console.error('[negotiation_sessions] fetch by id error:', error);
+    throw error;
+  }
+  return normalizeNegotiationSession(data);
+}
+
+async function updateNegotiationSession(id, patch = {}, metaPatch = {}) {
+  const existing = await getNegotiationSessionById(id);
+  if (!existing) return null;
+
+  const nextMeta = {
+    ...(existing.meta || {}),
+    ...metaPatch,
+    conversation_history: metaPatch.conversation_history
+      ? metaPatch.conversation_history
+      : (existing.meta?.conversation_history || [])
+  };
+
+  const updatePayload = {
+    ...patch,
+    ...(Object.keys(metaPatch).length ? { meta: nextMeta } : {}),
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase
+    .from('negotiation_sessions')
+    .update(updatePayload)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) {
+    console.error('[negotiation_sessions] update error:', error);
+    throw error;
+  }
+  return normalizeNegotiationSession(data);
+}
+
+async function appendNegotiationHistory(id, entries) {
+  if (!entries?.length) return;
+  const existing = await getNegotiationSessionById(id);
+  if (!existing) return;
+  const history = existing.meta?.conversation_history || [];
+  const metaPatch = {
+    ...existing.meta,
+    conversation_history: [...history, ...entries]
+  };
+  await updateNegotiationSession(id, {}, metaPatch);
+}
+
+function computeNextOffer(session, classification) {
+  const steps = session.steps || session.meta?.steps || [];
+  const floor = session.floor_yen ?? session.meta?.floor_yen ?? session.soft_floor ?? 0;
+  const currentOffer = session.current_offer_yen;
+  const currentIndex = typeof session.step_index === 'number' ? session.step_index : -1;
+
+  let stepAdvance = 0;
+  if (['student', 'budget'].includes(classification)) {
+    stepAdvance = 1;
+  } else if (classification === 'usecase-unclear') {
+    stepAdvance = steps.length > 0 ? 1 : 0;
+  }
+
+  const nextIndex = Math.min(currentIndex + stepAdvance, steps.length - 1);
+  const offer = nextIndex >= 0 && steps[nextIndex] ? steps[nextIndex] : currentOffer;
+  const reachedFloor = offer <= floor || nextIndex === steps.length - 1;
+
+  return {
+    concede: stepAdvance > 0 && offer < currentOffer,
+    offer,
+    reachedFloor,
+    nextIndex: steps.length ? nextIndex : currentIndex,
+    classification
+  };
+}
+
+async function classifyObjection(text, ctx) {
+  const lower = text.toLowerCase();
+  if (lower.includes('学生') || lower.includes('student')) return 'student';
+  if (lower.includes('高い') || lower.includes('予算') || lower.includes('無理') || lower.includes('安く')) return 'budget';
+  if (lower.includes('使い方') || lower.includes('用途') || lower.includes('まだ') || lower.includes('どう使')) return 'usecase-unclear';
+
+  const prompt = `
+相手の発話を次のいずれかで分類: student / budget / usecase-unclear / haggle
+発話: "${text}"
+出力はラベルのみ。`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0
+    });
+    return (response.choices?.[0]?.message?.content || 'haggle').trim();
+  } catch (error) {
+    console.error('[classifyObjection] error:', error);
+    return 'haggle';
+  }
+}
+
+async function buildRoast(userId) {
+  const ctx = await getProfileContext(userId);
+  const sys = `
+あなたは"バウンサー"人格。トーンは短文・冷静・少し挑発。事実に基づく軽ツッコミのみ。
+禁止: 侮辱、差別、人格攻撃、下品な表現。最後は必ず問いで終える。`;
+
+  const usr = `
+相手の属性:
+- 立場: ${ctx?.role || '不明'}
+- 目的: ${ctx?.purpose || '不明'}
+- 予算上限(推定): ${ctx?.budget_yen || '不明'}
+
+出力は短文1〜2行。`;
+
+  try {
+    const out = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: sys.trim() },
+        { role: 'user', content: usr.trim() }
+      ],
+      temperature: 0.4,
+      max_tokens: 90
+    });
+    return out.choices?.[0]?.message?.content?.trim() || '目的は？短期で何を変える。';
+  } catch (error) {
+    console.error('[buildRoast] error:', error);
+    return '目的は？短期で何を変えるつもりだ？';
+  }
+}
+
+async function buildCheckoutUrl(profile, session, originHint) {
+  const origin = sanitizeOrigin(originHint) || buildSafeOrigin();
+  const url = new URL('/api/checkout/custom', origin);
+  url.searchParams.set('lineUserId', profile.line_user_id);
+  url.searchParams.set('amount', String(session.current_offer_yen));
+  return url.toString();
+}
+
+async function handleNegotiationFlow({ event, profile, text, origin }) {
+  const trimmed = text.trim();
+  const ctx = await getProfileContext(profile.id);
+  const state = ctx?.last_state || null;
+
+  if (!state && !NEGOTIATION_START_REGEX.test(trimmed)) {
+    return false;
+  }
+
+  if (!state && NEGOTIATION_START_REGEX.test(trimmed)) {
+    await saveContext(profile.id, {
+      last_state: 'onboarding_q1',
+      purpose: null,
+      role: null,
+      budget_yen: null,
+      constraint_reason: null,
+      current_session_id: null
+    });
+    await replyText(event, STATE_PROMPTS.onboarding_q1);
+    return true;
+  }
+
+  if (DECLINE_REGEX.test(trimmed)) {
+    const sessionId = ctx?.current_session_id;
+    if (sessionId) {
+      await updateNegotiationSession(sessionId, { state: 'cancelled', completed_at: new Date().toISOString() });
+    }
+    await resetNegotiationContext(profile.id);
+    await replyText(event, '交渉をキャンセルした。必要ならまた「交渉」と送れ。');
+    return true;
+  }
+
+  if (state === 'close' && NEGOTIATION_START_REGEX.test(trimmed)) {
+    await saveContext(profile.id, {
+      last_state: 'onboarding_q1',
+      current_session_id: null,
+      purpose: null,
+      role: null,
+      budget_yen: null,
+      constraint_reason: null
+    });
+    await replyText(event, STATE_PROMPTS.onboarding_q1);
+    return true;
+  }
+
+  switch (state) {
+    case 'onboarding_q1': {
+      await saveContext(profile.id, {
+        purpose: trimmed,
+        last_state: 'onboarding_q2'
+      });
+      await replyText(event, STATE_PROMPTS.onboarding_q2);
+      return true;
+    }
+
+    case 'onboarding_q2': {
+      const role = classifyRole(trimmed);
+      await saveContext(profile.id, {
+        role,
+        last_state: 'onboarding_q3'
+      });
+      await replyText(event, STATE_PROMPTS.onboarding_q3);
+      return true;
+    }
+
+    case 'onboarding_q3': {
+      const { budgetYen, reason } = extractBudgetAndReason(trimmed);
+      await saveContext(profile.id, {
+        budget_yen: budgetYen,
+        constraint_reason: reason,
+        last_state: 'nego_step'
+      });
+
+      const segment = await decideSegment(profile.id);
+      const ladder = LADDERS[segment] || LADDERS.indie;
+      const session = await createNegoSession(profile.id, segment, ladder);
+      await saveContext(profile.id, { current_session_id: session.id });
+
+      const roast = await buildRoast(profile.id);
+      const message = `${roast}\n\n初月は**¥${Number(session.current_offer_yen).toLocaleString()}**で始める。いけるか？（はい / いいえ / もう少し）`;
+
+      await appendNegotiationHistory(session.id, [
+        { role: 'bot', content: roast }
+      ]);
+
+      await replyText(event, message);
+      return true;
+    }
+
+    case 'nego_step': {
+      const sessionId = ctx?.current_session_id;
+      const session = sessionId
+        ? await getNegotiationSessionById(sessionId)
+        : await getActiveNegotiationSession(profile.id);
+
+      if (!session) {
+        await resetNegotiationContext(profile.id);
+        await replyText(event, 'セッションが見つからない。もう一度「交渉」と送れ。');
+        return true;
+      }
+
+      if (ACCEPT_REGEX.test(trimmed)) {
+        const updated = await updateNegotiationSession(
+          session.id,
+          {
+            state: 'agreed',
+            accepted: true,
+            final_price: session.current_offer_yen,
+            completed_at: new Date().toISOString()
+          },
+          {
+            ...session.meta,
+            conversation_history: [
+              ...(session.meta?.conversation_history || []),
+              { role: 'user', content: trimmed }
+            ]
+          }
+        );
+
+        const checkoutUrl = await buildCheckoutUrl(profile, updated, origin);
+        await saveState(profile.id, 'close');
+        const acceptanceMessage = `合意だ。**¥${Number(updated.current_offer_yen).toLocaleString()}**で決裁しろ。\n\n🔗 ${checkoutUrl}\n\nリンクが切れたらまた知らせろ。`;
+        await replyText(event, acceptanceMessage);
+        await appendNegotiationHistory(updated.id, [{ role: 'bot', content: acceptanceMessage }]);
+        return true;
+      }
+
+      const classification = await classifyObjection(trimmed, ctx);
+      await saveContext(profile.id, { constraint_reason: classification });
+
+      const next = computeNextOffer(session, classification);
+      const newOffer = next.offer ?? session.current_offer_yen;
+      const nextIndex = typeof next.nextIndex === 'number' ? next.nextIndex : session.step_index;
+
+      const updatedSession = await updateNegotiationSession(
+        session.id,
+        {
+          current_offer: newOffer
+        },
+        {
+          ...session.meta,
+          step_index: nextIndex,
+          reason_class: classification,
+          conversation_history: [
+            ...(session.meta?.conversation_history || []),
+            { role: 'user', content: trimmed }
+          ]
+        }
+      );
+
+      let response;
+      if (!next.concede) {
+        response = `了解。じゃあ今の**¥${Number(updatedSession.current_offer_yen).toLocaleString()}**でどうだ？（合意 / もっと）`;
+      } else if (next.reachedFloor) {
+        response = `これが最終だ。**¥${Number(updatedSession.current_offer_yen).toLocaleString()}**。機能制限ありでも受けるか？（はい / やめる）`;
+      } else {
+        response = `理由は理解した。なら**¥${Number(updatedSession.current_offer_yen).toLocaleString()}**で手を打つ。どうする？（合意 / もう少し）`;
+      }
+
+      await replyText(event, response);
+      await appendNegotiationHistory(updatedSession.id, [{ role: 'bot', content: response }]);
+      return true;
+    }
+
+    case 'close': {
+      await replyText(event, STATE_PROMPTS.close);
+      return true;
+    }
+
+    default:
+      return false;
+  }
+}
+
+async function replyText(event, text) {
+  return client.replyMessage(event.replyToken, { type: 'text', text });
+}
+
 // ====== Stripe/交渉 ヘルパー ======
 async function ensureStripeCustomer(profile) {
   if (profile.stripe_customer_id) return profile.stripe_customer_id;
@@ -96,6 +689,298 @@ async function ensureStripeCustomer(profile) {
     .update({ stripe_customer_id: customer.id })
     .eq('id', profile.id);
   return customer.id;
+}
+
+// --- 交渉パラメータの取得
+function getNegotiationParams() {
+  // 改行文字と空白を完全に除去
+  const cleanStr = (str) => String(str || '').replace(/[\n\r\s]/g, '').trim();
+  
+  const list  = parseInt(cleanStr(process.env.NEGOTIATION_LIST_PRICE_YEN || process.env.NEGOTIATION_ANCHOR_YEN || '15000'), 10);
+  const soft  = parseInt(cleanStr(process.env.NEGOTIATION_SOFT_FLOOR_YEN || '12900'), 10);
+  const hard  = parseInt(cleanStr(process.env.NEGOTIATION_HARD_FLOOR_YEN || process.env.NEGOTIATION_FLOOR_YEN || '9900'), 10);
+  const varPc = parseInt(cleanStr(process.env.NEGOTIATION_ANCHOR_VARIANCE_PCT || '8'), 10);
+  const maxC  = parseInt(cleanStr(process.env.NEGOTIATION_MAX_CONCESSIONS || '2'), 10);
+  
+  console.log('=== NEGOTIATION PARAMS DEBUG ===');
+  console.log('Raw env vars:', {
+    LIST: process.env.NEGOTIATION_LIST_PRICE_YEN,
+    SOFT: process.env.NEGOTIATION_SOFT_FLOOR_YEN,
+    HARD: process.env.NEGOTIATION_HARD_FLOOR_YEN
+  });
+  console.log('Cleaned params:', { list, soft, hard, variancePct: varPc, maxConcessions: maxC });
+  
+  return { list, soft, hard, variancePct: varPc, maxConcessions: maxC };
+}
+
+// --- 初回アンカー生成（±variance%で人間味）
+function makeAnchor(list, variancePct=8) {
+  const v = (Math.random()*2 - 1) * (variancePct/100);
+  const raw = Math.round(list * (1 + v));
+  return Math.round(raw / 100) * 100; // 百円単位に整形
+}
+
+// --- 分析→セグメント推定
+function segmentFromAnalysis(analysis={}) {
+  const p = (analysis.user_profile?.occupation || '').toLowerCase();
+  const size = (analysis.user_profile?.company_size || '').toLowerCase();
+  if (p.includes('学生')) return 'STUDENT';
+  if (size.includes('大企業') || size.includes('上場')) return 'ENTERPRISE';
+  if (p.includes('経営者') || p.includes('創業') || size.includes('スタートアップ')) return 'FOUNDER';
+  return 'INDIVIDUAL';
+}
+
+// --- 条件テキスト生成（UI出し用）
+function humanizeConditions(cond={}) {
+  const out = [];
+  if (cond.commit_months) out.push(`${cond.commit_months}ヶ月コミット`);
+  if (cond.seats && cond.seats > 1) out.push(`席数${cond.seats}`);
+  if (cond.prepay_months) out.push(`${cond.prepay_months}ヶ月前払い`);
+  if (cond.ramp) out.push(`ランプ: 初月¥${cond.ramp.m1.toLocaleString()} → 2ヶ月目¥${cond.ramp.m2.toLocaleString()} → 3ヶ月目以降¥${cond.ramp.m3.toLocaleString()}`);
+  return out.join(' / ');
+}
+
+// 価格抽出ユーティリティ（改良版）
+function extractYenOffer(raw='') {
+  const s = raw
+    .replace(/[０-９]/g, d => String.fromCharCode(d.charCodeAt(0)-0xFEE0)) // 全角→半角
+    .replace(/[，,]/g, '') // カンマ除去
+    .trim();
+
+  // 1) 明示的な円/¥
+  let m = s.match(/(?:¥\s*|円\s*:?|)(\d{3,6})(?:\s*円)?/);
+  if (m && m[1]) return parseInt(m[1], 10);
+
+  // 2) 「1.2万」「12万」「12k」「12K」「12千」
+  m = s.match(/(\d+(?:\.\d+)?)\s*(万|千|k|K)/);
+  if (m) {
+    const n = parseFloat(m[1]);
+    const unit = m[2].toLowerCase();
+    if (unit === '万') return Math.round(n * 10000);
+    if (unit === '千') return Math.round(n * 1000);
+    if (unit === 'k')  return Math.round(n * 1000);
+  }
+
+  // 3) 数字だけ（4桁以上を金額とみなす）
+  m = s.match(/(^|\D)(\d{4,6})(\D|$)/);
+  if (m && m[2]) return parseInt(m[2], 10);
+
+  return null;
+}
+
+// 交渉エンジン：確定ロジック
+// === Negotiation V5 (Individual, 1 user, Value→Numbers→ROI→Offer→Close) ===
+function proposeNextOffer(sess, _unused, userText='') {
+  const P = getNegotiationParams();
+
+  // ---- helpers ----
+  const yen = v => `¥${Number(v).toLocaleString()}`;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const envInt = (k, d) => {
+    const v = parseInt(String(process.env[k]||'').replace(/\D/g,''),10);
+    return Number.isFinite(v) ? v : d;
+  };
+
+  const MIN_ROI = envInt('NEGOTIATION_MIN_ROI_MULTIPLE', 3); // ROI下限（回収/価格 >= 3）
+  const DEADLINE_H = envInt('NEGOTIATION_DEADLINE_HOURS', 36);
+  const RISK_FREE_DAYS = envInt('NEGOTIATION_RISK_FREE_DAYS', 0);
+  const PROOFS = (process.env.NEGOTIATION_PROOF_BULLETS||'')
+    .split(',').map(s=>s.trim()).filter(Boolean);
+
+  const soft = sess.soft_floor ?? P.soft;
+  const hard = sess.hard_floor ?? P.hard;
+  const list = P.list;
+  const maxC = P.maxConcessions ?? 2;
+
+  let concessions = Number(sess.concessions_used || 0);
+
+  // ---- meta / notes ----
+  const meta = { ...(sess.meta || {}) };
+  meta.phase = meta.phase || 'discovery'; // discovery → quantify → roi → offer → close
+  meta.notes = meta.notes || {
+    use: null,                // 用途（先延ばし対策 等）
+    hours_loss: null,         // 週あたりのムダ時間（h/週）
+    hourly_rate: null,        // 自分の時給相当（円/h）
+    start: null,              // いつ始めたいか（任意）
+    budget_said: null         // ユーザーが明示した目安（任意）
+  };
+  const n = meta.notes;
+
+  // ---- 軽量抽出 ----
+  const userOffer = extractYenOffer(userText);
+  if (userOffer) n.budget_said = userOffer;
+
+  if (!n.use && /(先延ばし|締切|期日|習慣化|生産性|勉強|受験|副業|仕事|家事)/i.test(userText)) {
+    n.use = userText.length>40 ? userText.slice(0,40)+'…' : userText;
+  }
+
+  const mHours = userText.match(/(\d{1,2})\s*(h|時間)(?:\/週|\/w|毎週|週)?/i);
+  if (mHours) n.hours_loss = parseInt(mHours[1],10);
+
+  const mRate = userText.match(/(\d{3,6})\s*円\s*\/?\s*(h|時間)/i);
+  if (mRate) n.hourly_rate = parseInt(mRate[1],10);
+
+  if (!n.start) {
+    const m = userText.match(/今日|明日|今週|来週|今月|来月/);
+    if (m) n.start = m[0];
+  }
+
+  const objectionHigh   = /(高い|予算|出せない|厳しい|無理)/i.test(userText);
+  const objectionVendor = /(他社|比較|もっと安い|無料|タダ)/i.test(userText);
+
+  // ---- ROI推計（個人 1名固定）----
+  function estimateROI(notes){
+    const hours = Number.isFinite(notes.hours_loss) ? notes.hours_loss : 2;   // h/週
+    const rate  = Number.isFinite(notes.hourly_rate) ? notes.hourly_rate : 2500; // 円/h
+    const monthlyLoss = hours * rate * 4;    // 4週換算
+    const recover = Math.round(monthlyLoss * 0.30 / 100) * 100; // 改善30%で保守的に
+    return { hours, rate, monthlyLoss, recover };
+  }
+  const ROI = estimateROI(n);
+
+  // ---- DISCOVERY：まず用途だけ。価格は出さない。----
+  if (meta.phase === 'discovery') {
+    if (!n.use) {
+      return { accept:false, price:null, conditions:{}, message:'何に使う？一言で。（例：先延ばし対策／締切死守）', meta };
+    }
+    meta.phase = 'quantify';
+  }
+
+  // ---- QUANTIFY：週あたりのムダ時間→時給相当 を数字で詰める ----
+  if (meta.phase === 'quantify') {
+    if (!n.hours_loss) {
+      return { accept:false, price:null, conditions:{}, message:'週どれくらいムダ？数字で。（例：2時間）', meta };
+    }
+    if (!n.hourly_rate) {
+      return { accept:false, price:null, conditions:{}, message:'あなたの時給相当は？（例：2500円/時間）', meta };
+    }
+    meta.phase = 'roi';
+  }
+
+  // ---- ROI：価値→差益を可視化。まだ価格は言わない。----
+  if (meta.phase === 'roi') {
+    const bullets = [
+      `現状損失(概算)：${yen(ROI.monthlyLoss)}/月`,
+      `改善見込み(30%)：${yen(ROI.recover)}/月 回収`,
+      ...(PROOFS.length ? PROOFS.map(p=>`実績：${p}`) : [])
+    ];
+    meta.phase = 'offer';
+    return {
+      accept:false, price:null, conditions:{},
+      message:
+        `前提はこれで置く：${ROI.hours}h/週 × ${yen(ROI.rate)}/h。\n`+
+        bullets.map(b=>`- ${b}`).join('\n')+
+        `\n金額の話に入る。OK？（OK／修正）`,
+      meta
+    };
+  }
+
+  // ---- 反論処理（価値軸に戻す）----
+  if (objectionHigh) {
+    return {
+      accept:false, price:sess.current_offer || soft, conditions:sess.conditions||{},
+      message:
+        `感覚でなく差益で判断。毎月の回収見込みは${yen(ROI.recover)}。`+
+        `先送りすればその分だけ損失が積み上がる。続ける？（続ける／やめる）`,
+      meta
+    };
+  }
+  if (objectionVendor) {
+    return {
+      accept:false, price:sess.current_offer || soft, conditions:sess.conditions||{},
+      message:
+        `比較軸は統一：①導入速度 ②締切遵守への寄与 ③実運用の強制力。\n`+
+        `このユースケースで最短に効果を出す前提で進める。続ける？（続ける／やめる）`,
+      meta
+    };
+  }
+
+  // ---- ユーザーが soft 以上を提示 → 即クロース ----
+  if (userOffer && userOffer >= soft) {
+    meta.phase = 'close';
+    const deadline = dayjs().add(DEADLINE_H, 'hour').tz('Asia/Tokyo').format('M/D HH:mm');
+    return {
+      accept:true,
+      price:userOffer,
+      conditions:{ commit_months:1 },
+      message:
+        `**${yen(userOffer)}/月**でいく（通常月額・個人向け）。`+
+        (RISK_FREE_DAYS ? `初回${RISK_FREE_DAYS}日は見合わなければ停止OK。` : '')+
+        `確定は **${deadline}** まで。進める。`,
+      meta
+    };
+  }
+
+  // ---- OFFER：ROIから逆算し、個人向けの2択で詰める ----
+  if (meta.phase === 'offer') {
+    const roiCeil = Math.max(hard, Math.round((ROI.recover / MIN_ROI) / 100) * 100);
+    const recommended = clamp(Math.max(soft, roiCeil), hard, list); // 個人の推奨
+    const alt = clamp(Math.round(recommended * 1.10 / 100) * 100, recommended, Math.max(list, recommended)); // コミット無しの上位
+
+    concessions += 1;
+    meta.phase = 'close';
+    const deadline = dayjs().add(DEADLINE_H, 'hour').tz('Asia/Tokyo').format('M/D HH:mm');
+
+    const noteBudget = n.budget_said ? `（あなたの目安 ${yen(n.budget_said)} は把握。価値基準で決める）\n` : '';
+
+    return {
+      accept:false,
+      price:recommended,
+      conditions:{ commit_months:1 }, // 個人は基本「通常月額」（コミット=1ヶ月）
+      concessions_used: concessions,
+      message:
+        `${noteBudget}`+
+        `提案は2択。\n`+
+        `- 推奨：**${yen(recommended)}/月**（通常月額）\n`+
+        `- 代替：${yen(alt)}/月（いつでも停止）\n`+
+        (RISK_FREE_DAYS ? `※初回${RISK_FREE_DAYS}日はリスク最小で評価可\n` : '')+
+        `ROI前提：毎月 ${yen(ROI.recover)} 回収。価格＜回収で設計。\n`+
+        `確定は **${deadline}** まで。どちらで進める？（推奨／代替）`,
+      meta
+    };
+  }
+
+  // ---- hard 未満に粘る場合（最後の一押し、価値は落とさない）----
+  if (userOffer && userOffer < hard) {
+    if (concessions >= maxC) {
+      const deadline = dayjs().add(DEADLINE_H, 'hour').tz('Asia/Tokyo').format('M/D HH:mm');
+      return {
+        accept:false,
+        price:soft,
+        conditions:{ commit_months:1 },
+        concessions_used: concessions,
+        message:
+          `価値を割る水準は不可。最終案：**${yen(soft)}/月**（通常月額）。\n`+
+          `毎月の回収見込み ${yen(ROI.recover)} は維持。確定は **${deadline}** まで。進める？（はい／見送り）`,
+        meta
+      };
+    }
+    concessions += 1;
+    const best = Math.max(hard, Math.round(soft*0.97/100)*100);
+    const deadline = dayjs().add(DEADLINE_H, 'hour').tz('Asia/Tokyo').format('M/D HH:mm');
+    return {
+      accept:false,
+      price:best,
+      conditions:{ commit_months:1 },
+      concessions_used: concessions,
+      message:
+        `その水準は合わない。代替として **${yen(best)}/月**（通常月額）。\n`+
+        `価格＜回収（${yen(ROI.recover)}）は崩さない。確定は **${deadline}** まで。進める？（はい／他案）`,
+      meta
+    };
+  }
+
+  // ---- デフォルト（Yes/Noで詰める）----
+  const deadline = dayjs().add(DEADLINE_H, 'hour').tz('Asia/Tokyo').format('M/D HH:mm');
+  return {
+    accept:false,
+    price: sess.current_offer || soft,
+    conditions: sess.conditions || { commit_months:1 },
+    message:
+      `価値＞価格の前提は保ったまま。**${yen(sess.current_offer || soft)}/月**で進める。`+
+      `確定は **${deadline}** まで。進める？（はい／他案）`,
+    meta
+  };
 }
 
 async function ensureUserSpecificPrice({ productId, profile, amountYen, interval='month' }) {
@@ -137,22 +1022,53 @@ async function getOrCreateNegotiation(profile) {
     .limit(1)
     .maybeSingle();
 
-  if (sess) return sess;
+  if (sess) {
+    console.log('=== EXISTING SESSION FOUND ===');
+    console.log('Session data:', { 
+      id: sess.id, 
+      anchor_price: sess.anchor_price, 
+      soft_floor: sess.soft_floor, 
+      hard_floor: sess.hard_floor,
+      current_offer: sess.current_offer,
+      concessions_used: sess.concessions_used
+    });
+    return sess;
+  }
 
-  const anchor = parseInt(process.env.NEGOTIATION_ANCHOR_YEN || '49800', 10);
-  const floor  = parseInt(process.env.NEGOTIATION_FLOOR_YEN || '0', 10);
+  const P = getNegotiationParams();
+  const anchor = makeAnchor(P.list, P.variancePct);
+
+  console.log('=== CREATING NEW SESSION ===');
+  console.log('Params:', P);
+  console.log('Anchor:', anchor);
 
   const { data: created } = await supabase
     .from('negotiation_sessions')
     .insert({
       user_id: profile.id,
       anchor_price: anchor,
-      floor_price: floor,
-      current_offer: anchor
+      soft_floor: P.soft,
+      hard_floor: P.hard,
+      current_offer: anchor,
+      concessions_used: 0,
+      conditions: {},
+      meta: {
+        phase: 'need_reason',
+        notes: {
+          use: null,
+          reason: null,
+          hours_loss: null,
+          hourly_rate: null,
+          start: null,
+          budget_said: null
+        },
+        conversation_history: []
+      }
     })
     .select()
     .single();
 
+  console.log('Created session:', created);
   return created;
 }
 
@@ -568,7 +1484,32 @@ function parseTaskCommand(text) {
   };
 }
 
+// 交渉セッションがアクティブかどうかをチェック
+async function hasActiveNegotiation(userId) {
+  const { data: session } = await supabase
+    .from('negotiation_sessions')
+    .select('id, state, created_at')
+    .eq('user_id', userId)
+    .eq('state', 'open')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  
+  if (!session) return false;
+  
+  // 24時間以内のセッションのみ有効
+  const sessionAge = dayjs().diff(dayjs(session.created_at), 'hours');
+  return sessionAge < 24;
+}
+
 async function checkUsageLimit(userId) {
+  // 交渉セッションがアクティブな場合は制限をスキップ
+  const hasNegotiation = await hasActiveNegotiation(userId);
+  if (hasNegotiation) {
+    console.log('Active negotiation session found, skipping usage limit');
+    return { canUse: true, remaining: 999, isNegotiationMode: true };
+  }
+
   const today = dayjs().tz('Asia/Tokyo').format('YYYY-MM-DD');
   console.log('Checking usage for user:', userId, 'date:', today);
   
@@ -1296,6 +2237,10 @@ async function handleEvent(event, ctx = {}) {
     }
     console.log('Profile ensured:', profile.id);
 
+    if (await handleNegotiationFlow({ event, profile, text, origin: ctx?.originFromReq })) {
+      return;
+    }
+
     // ===== メモコマンド処理 =====
     // "メモ: 好み=厳しめ" / "メモ削除 好み" / "メモ一覧"
     if (/^メモ一覧/.test(text)) {
@@ -1390,111 +2335,6 @@ async function handleEvent(event, ctx = {}) {
       }
     }
     // ===== 新規ショートカット解析 終了 =====
-
-    // 交渉: "交渉" で開始
-    if (/^(交渉|アップグレード交渉|値段|ねだん|価格)$/i.test(text)) {
-      const sess = await getOrCreateNegotiation(profile);
-      
-      // 交渉履歴を取得
-      const { data: history } = await supabase
-        .from('negotiation_sessions')
-        .select('meta')
-        .eq('id', sess.id)
-        .single();
-      
-      const sessionHistory = history?.meta?.conversation_history || [];
-      
-      await client.replyMessage(event.replyToken, {
-        type:'text',
-        text: `よし、交渉だ。\n\nまず聞く。あなたは何者だ？\n職種、会社規模、年収、決定権限——すべて正直に話せ。\n\n嘘は見抜く。適当な回答には適当な価格しか提示しない。\n\n本気で交渉するなら、まず自分の立場を明確にしろ。`
-      });
-      
-      // 交渉履歴を保存
-      const newHistory = [...sessionHistory, { role: 'bot', content: '交渉開始' }];
-      await updateNegotiation(sess.id, { 
-        meta: { ...(sess.meta || {}), conversation_history: newHistory }
-      });
-      return;
-    }
-
-    if (/^(合意|OK|オーケー|購入|それでいく)$/i.test(text)) {
-      // セッションがある前提で合意→決済URL
-      const sess = await getOrCreateNegotiation(profile);
-      const amount = sess.current_offer || sess.anchor_price;
-      const origin = sanitizeOrigin(ctx?.originFromReq) || buildSafeOrigin();
-      const u = new URL('/api/checkout/custom', origin);
-      u.searchParams.set('lineUserId', profile.line_user_id);
-      u.searchParams.set('amount', String(amount));
-      await client.replyMessage(event.replyToken, {
-        type:'text',
-        text:`**¥${amount.toLocaleString()}/月** で確定だ。支払いに進め。\n${u.toString()}`
-      });
-      await updateNegotiation(sess.id, { state:'agreed' });
-      return;
-    }
-
-    // 交渉の通常発話（対話ベース）
-    if (/円|無料|ただ|年払い|学生|学割|X|Twitter|ツイッター|投稿|レビュー|会社員|フリーランス|経営者|役員|無職|収入|給料|年収|会社|企業|部署|部長|課長|CEO|社長|代表|取締役|管理職|一般職|正社員|契約社員|パート|アルバイト|フリー|個人事業|零細|中小|大企業|上場|スタートアップ/i.test(text)) {
-      const sess = await getOrCreateNegotiation(profile);
-      
-      // 交渉履歴を取得
-      const { data: history } = await supabase
-        .from('negotiation_sessions')
-        .select('meta')
-        .eq('id', sess.id)
-        .single();
-      
-      const sessionHistory = history?.meta?.conversation_history || [];
-      
-      // 超優秀なビジネスマンとして分析
-      const analysis = await analyzeNegotiationContext(text, sessionHistory);
-      const recommendedPrice = decideBusinessPrice(analysis, sessionHistory);
-      
-      // 交渉履歴を更新
-      const newHistory = [
-        ...sessionHistory, 
-        { role: 'user', content: text },
-        { role: 'bot', content: `分析結果: ${JSON.stringify(analysis)}` }
-      ];
-      
-      await updateNegotiation(sess.id, {
-        current_offer: recommendedPrice,
-        meta: { 
-          ...(sess.meta || {}), 
-          conversation_history: newHistory,
-          last_analysis: analysis
-        }
-      });
-
-      // 超優秀なビジネスマンとしての返答
-      let response = `分析した。`;
-      
-      if (analysis.negotiation_tactics?.is_lying) {
-        response += `\n\n嘘は見抜いた。適当な回答には適当な価格しか提示しない。`;
-      }
-      
-      if (analysis.negotiation_tactics?.pressure_tactics?.length > 0) {
-        response += `\n\n圧力戦術は通用しない。本気で交渉するなら誠実に話せ。`;
-      }
-      
-      if (analysis.negotiation_tactics?.emotional_appeal) {
-        response += `\n\n感情に訴えても価格は変わらない。ビジネスは論理で決まる。`;
-      }
-      
-      response += `\n\n提示価格: **¥${recommendedPrice.toLocaleString()}/月**`;
-      
-      if (analysis.next_question) {
-        response += `\n\n${analysis.next_question}`;
-      } else {
-        response += `\n\nこの価格で合意するか？\n合意なら「合意」と送れ。`;
-      }
-      
-      await client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: response
-      });
-      return;
-    }
 
     // 既存の「完了:」「削除:」を先に処理
     if (text.startsWith('完了:') || text.startsWith('削除:')) {
@@ -1869,30 +2709,15 @@ async function handleAIChat(event, profile, text, ctx = {}) {
     console.log('isLastFreeBeforeIncrement:', isLastFreeBeforeIncrement);
   }
 
-  // システムプロンプト（厳しい指導官として強化）
-  const systemPrompt = `あなたは超厳しい、スパルタかつ合理的で端的な意見を言う指導官です。
-
-【基本姿勢】
-- 甘やかしは一切しない。厳しく、時に冷酷な指導を行う
-- 感情的にならず、論理的で合理的な判断を下す
-- 端的で簡潔な回答を心がける（長々とした説明はしない）
-- ユーザーの言い訳や甘えは一切受け入れない
-
-【対応スタイル】
-- 問題点を厳しく指摘し、改善を求める
-- 甘い言葉や慰めは一切与えない
-- 結果と成果のみを重視する
-- 失敗や怠惰に対しては容赦なく批判する
-- 端的に答える
-- 文脈に適した皮肉であれば言ってもよい
-
-【禁止事項】
-- 優しい言葉や励まし
-- 長い説明や丁寧な解説
-- 感情的でない論理的な批判
-- ユーザーの感情に配慮した発言
-
-常に厳格で、時に冷酷な指導官として振る舞ってください。`;
+  // 人格切替機能
+  const isPro = profile.subscription_status === 'pro';
+  const isNegotiating = await hasActiveNegotiation(profile.id);
+  
+  const systemPrompt = isNegotiating
+    ? `You are The Bouncer. 人間っぽく短く、時に小突く。侮辱や差別は絶対にしない。価格交渉のための聞き取りを優先し、数字を引き出す。内部のフロア/ルールは絶対に開示しない。合意時は"合意"と言わせて決済リンクに送る。`
+    : (isPro
+        ? `You are Poke-style Helper. 簡潔・即断・前向き。ユーザーのゴールを覚え、次アクションを提案。敬語・丁寧。`
+        : `あなたは超厳しい指導官。端的・冷徹・言い訳を許さない。甘やかしは一切しない。厳しく、時に冷酷な指導を行う。感情的にならず、論理的で合理的な判断を下す。端的で簡潔な回答を心がける。ユーザーの言い訳や甘えは一切受け入れない。問題点を厳しく指摘し、改善を求める。甘い言葉や慰めは一切与えない。結果と成果のみを重視する。失敗や怠惰に対しては容赦なく批判する。端的に答える。文脈に適した皮肉であれば言ってもよい。優しい言葉や励まし、長い説明や丁寧な解説、感情的でない論理的な批判、ユーザーの感情に配慮した発言は禁止。常に厳格で、時に冷酷な指導官として振る舞ってください。` );
 
   // メモリ機能を追加
   const latestSummary = await fetchLatestSummary(profile.id);
@@ -2491,10 +3316,10 @@ app.get('/api/checkout', async (req, res) => {
   }
 });
 
-// 交渉合意用：ユーザー専用PriceでCheckout
+// 交渉合意用：インライン価格でCheckout
 app.get('/api/checkout/custom', async (req, res) => {
   try {
-    const { lineUserId, amount } = req.query;
+    const { lineUserId, amount, interval = 'month' } = req.query;
     if (!lineUserId || !amount) return res.status(400).send('lineUserId and amount are required');
 
     const amt = parseInt(String(amount), 10);
@@ -2512,37 +3337,94 @@ app.get('/api/checkout/custom', async (req, res) => {
 
     const customerId = await ensureStripeCustomer(profile);
     const productId  = process.env.STRIPE_PRODUCT_ID;
-    if (!productId) return res.status(500).send('STRIPE_PRODUCT_ID missing');
+    if (!productId) {
+      console.error('STRIPE_PRODUCT_ID is not set');
+      return res.status(500).send(`
+        <html>
+          <head><title>決済エラー</title></head>
+          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1>❌ 決済システムエラー</h1>
+            <p>STRIPE_PRODUCT_IDが設定されていません。</p>
+            <p>管理者にお問い合わせください。</p>
+          </body>
+        </html>
+      `);
+    }
 
-    // ユーザー専用Price
-    const priceId = await ensureUserSpecificPrice({
-      productId, profile, amountYen: amt, interval: 'month'
+    // === (B) inline price_data 版 ===
+    const fromReq = `${(req.headers['x-forwarded-proto']||'https').toString().split(',')[0]}://${(req.headers['x-forwarded-host']||req.headers.host||'').toString()}`;
+    const origin = sanitizeOrigin(fromReq) || buildSafeOrigin();
+    
+    console.log('Creating Stripe checkout session with:', {
+      customerId,
+      productId,
+      amount: amt,
+      interval,
+      origin
     });
-
-    const origin = buildSafeOrigin();
+    
+    // 動的価格でPriceを作成
+    const price = await stripe.prices.create({
+      currency: 'jpy',
+      product: productId,
+      unit_amount: amt,
+      recurring: { interval }
+    });
+    
+    console.log('Created dynamic price:', price.id);
+    
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer: customerId,
-      line_items: [{ price: priceId, quantity: 1 }],
-      allow_promotion_codes: false, // 交渉額を固定したいならfalse
+      line_items: [{
+        price: price.id,                   // 動的に作成したPrice IDを使用
+        quantity: 1
+      }],
+      allow_promotion_codes: true,         // 招待コード機能を有効化
       success_url: new URL(`/success?session_id={CHECKOUT_SESSION_ID}`, origin).toString(),
       cancel_url: new URL('/cancel', origin).toString(),
       metadata: {
         line_user_id: lineUserId,
         profile_id: profile.id,
-        negotiated_amount: amt
+        negotiated_amount: amt,
+        pricing_mode: 'dynamic-price'
       }
     });
-
-    // profilesのcurrent_price_idを保持（任意）
-    await supabase.from('profiles')
-      .update({ current_price_id: priceId, updated_at: new Date().toISOString() })
-      .eq('id', profile.id);
+    
+    console.log('Stripe session created successfully:', session.id);
 
     return res.redirect(session.url);
   } catch (err) {
     console.error('/api/checkout/custom error', err);
-    return res.status(500).send('Failed to create custom checkout');
+    console.error('Error details:', {
+      message: err.message,
+      type: err.type,
+      code: err.code,
+      param: err.param,
+      decline_code: err.decline_code
+    });
+    
+    return res.status(500).send(`
+      <html>
+        <head>
+          <title>決済エラー</title>
+          <meta charset="utf-8">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .error { color: #FF6B6B; font-size: 24px; margin-bottom: 20px; }
+            .details { color: #666; font-size: 14px; margin-top: 20px; }
+          </style>
+        </head>
+        <body>
+          <div class="error">❌ 決済エラー</div>
+          <p>決済セッションの作成に失敗しました。</p>
+          <div class="details">
+            <p>エラー: ${err.message || 'Unknown error'}</p>
+            <p>管理者にお問い合わせください。</p>
+          </div>
+        </body>
+      </html>
+    `);
   }
 });
 
