@@ -244,16 +244,6 @@ function findTierAtOrBelow(value) {
   return candidate || PRICE_TIERS[0];
 }
 
-function findTierAbove(value) {
-  if (!Number.isFinite(value)) return null;
-  for (let i = 0; i < PRICE_TIERS.length; i += 1) {
-    if (PRICE_TIERS[i] === value) {
-      return PRICE_TIERS[i + 1] ?? null;
-    }
-  }
-  return null;
-}
-
 function lowerPriceTier(current) {
   const currentIndex = PRICE_TIERS.findIndex(tier => tier === current);
   if (currentIndex <= 0) return current;
@@ -284,8 +274,7 @@ function normalizeNegotiationSession(row) {
   };
 }
 
-async function createNegoSession({ userId, goal, blocker, costYen, priceYen, recommendedPriceYen }) {
-  const recommendedPrice = Number.isFinite(recommendedPriceYen) ? recommendedPriceYen : priceYen;
+async function createNegoSession({ userId, goal, blocker, costYen, priceYen }) {
   const payload = {
     user_id: userId,
     state: 'open',
@@ -299,7 +288,6 @@ async function createNegoSession({ userId, goal, blocker, costYen, priceYen, rec
       blocker,
       cost_estimate_yen: costYen,
       plan_price_yen: priceYen,
-      recommended_price_yen: recommendedPrice,
       discount_applied: false,
       conversation_history: []
     }
@@ -395,34 +383,6 @@ async function appendNegotiationHistory(id, entries) {
   await updateNegotiationSession(id, {}, metaPatch);
 }
 
-function classifyObjection(text = '') {
-  const lower = text.toLowerCase();
-  if (
-    lower.includes('高い') ||
-    lower.includes('予算') ||
-    lower.includes('無理') ||
-    lower.includes('安く') ||
-    lower.includes('もう少し') ||
-    lower.includes('もっと') ||
-    lower.includes('値下げ') ||
-    lower.includes('安い') ||
-    lower.includes('割引') ||
-    lower.includes('厳しい') ||
-    lower.includes('出せない')
-  ) {
-    return 'budget';
-  }
-  if (
-    lower.includes('考え') ||
-    lower.includes('検討') ||
-    lower.includes('迷') ||
-    lower.includes('悩') ||
-    lower.includes('あとで')
-  ) {
-    return 'considering';
-  }
-  return 'other';
-}
 
 // 価格整合性の防御関数
 function getOfferYen(session) {
@@ -539,7 +499,7 @@ async function handleNegotiationFlow({ event, profile, text, origin, context }) 
     }
   }
 
-  const ensureSession = async ({ goalForMeta, blockerForMeta, costForMeta, priceForMeta, recommendedPriceForMeta } = {}) => {
+  const ensureSession = async ({ goalForMeta, blockerForMeta, costForMeta, priceForMeta } = {}) => {
     if (session) return session;
     const priceSeed = Number.isFinite(priceForMeta) ? priceForMeta : PRICE_TIERS[0];
     session = await createNegoSession({
@@ -547,8 +507,7 @@ async function handleNegotiationFlow({ event, profile, text, origin, context }) 
       goal: goalForMeta ?? ctx?.goal ?? null,
       blocker: blockerForMeta ?? ctx?.blocker ?? null,
       costYen: costForMeta ?? ctx?.monthly_cost_estimate ?? null,
-      priceYen: priceSeed,
-      recommendedPriceYen: Number.isFinite(recommendedPriceForMeta) ? recommendedPriceForMeta : priceSeed
+      priceYen: priceSeed
     });
       await saveContext(profile.id, { current_session_id: session.id });
     if (ctx) ctx.current_session_id = session.id;
@@ -558,11 +517,7 @@ async function handleNegotiationFlow({ event, profile, text, origin, context }) 
   switch (state) {
     case 'goal': {
       const goalText = trimmed;
-      session = await ensureSession({
-        goalForMeta: goalText,
-        priceForMeta: PRICE_TIERS[0],
-        recommendedPriceForMeta: PRICE_TIERS[0]
-      });
+      session = await ensureSession({ goalForMeta: goalText, priceForMeta: PRICE_TIERS[0] });
       if (!session) throw new Error('session missing after ensure in goal');
 
       const history = [
@@ -627,16 +582,11 @@ async function handleNegotiationFlow({ event, profile, text, origin, context }) 
       const costYen = extractMonthlyCost(trimmed);
       if (!Number.isFinite(costYen)) {
         await replyText(event, STATE_PROMPTS.cost_retry);
-        return true;
-      }
+      return true;
+    }
 
-      const basePriceYen = pickPlanPrice(costYen);
-      const anchorPriceYen = findTierAbove(basePriceYen) ?? basePriceYen;
-      session = await ensureSession({
-        costForMeta: costYen,
-        priceForMeta: anchorPriceYen,
-        recommendedPriceForMeta: basePriceYen
-      });
+      const priceYen = pickPlanPrice(costYen);
+      session = await ensureSession({ costForMeta: costYen, priceForMeta: priceYen });
       if (!session) throw new Error('session missing after ensure in cost');
 
       const history = [
@@ -647,13 +597,12 @@ async function handleNegotiationFlow({ event, profile, text, origin, context }) 
       session = await updateNegotiationSession(
         session.id,
         {
-          anchor_price: anchorPriceYen,
-          current_offer: anchorPriceYen
+          anchor_price: priceYen,
+          current_offer: priceYen
         },
         {
           cost_estimate_yen: costYen,
-          plan_price_yen: anchorPriceYen,
-          recommended_price_yen: basePriceYen,
+          plan_price_yen: priceYen,
           conversation_history: history
         }
       );
@@ -669,7 +618,7 @@ async function handleNegotiationFlow({ event, profile, text, origin, context }) 
       const pitch = buildPlanPitch({
         goal: goalLine,
         blocker: blockerLine,
-        priceYen: anchorPriceYen
+        priceYen
       });
 
       await replyText(event, pitch);
@@ -746,82 +695,52 @@ async function handleNegotiationFlow({ event, profile, text, origin, context }) 
         return true;
       }
 
-      const classification = classifyObjection(trimmed);
-      await saveContext(profile.id, { constraint_reason: classification });
-
       let price = getOfferYen(session);
-
-      if (classification === 'budget') {
-        // 値下げ交渉の確率判定
-        const isFirstNegotiation = !session.meta?.discount_applied;
-        const discountProbability = isFirstNegotiation ? 0.5 : 0.15; // 初回50%、以降15%
-        const shouldDiscount = Math.random() < discountProbability;
+      
+      // 値下げ交渉の確率判定
+      const isFirstNegotiation = !session.meta?.discount_applied;
+      const discountProbability = isFirstNegotiation ? 0.5 : 0.15; // 初回50%、以降15%
+      const shouldDiscount = Math.random() < discountProbability;
+      
+      console.log('=== 値下げ交渉判定 ===');
+      console.log('Is first negotiation:', isFirstNegotiation);
+      console.log('Discount probability:', discountProbability);
+      console.log('Should discount:', shouldDiscount);
+      console.log('Current price:', price);
+      
+      if (shouldDiscount) {
         const nextPrice = lowerPriceTier(price);
-        
-        if (shouldDiscount) {
-          if (nextPrice < price) {
-            await updateNegotiationSession(
-              session.id,
-              { current_offer: nextPrice },
-              {
-                plan_price_yen: nextPrice,
-                discount_applied: true
-              }
-            );
-            const oldPriceStr = price.toLocaleString();
-            price = nextPrice;
-            const newPriceStr = price.toLocaleString();
-            const response = `仕方がない。¥${oldPriceStr}から¥${newPriceStr}まで妥協してやる。もう譲れない。\n\n先延ばしを止めるか、現状維持のままか。\n\n即決しろ。「はい」か「合意」と返せ。即座に決済リンクを送る。`;
-            await replyText(event, response);
-            await appendNegotiationHistory(session.id, [{ role: 'bot', content: response }]);
-            return true;
-          } else {
-            const floorPriceStr = price.toLocaleString();
-            const response = `限界だ。**¥${floorPriceStr}**が最安値だ。これ以上は譲れない。覚悟を決めるなら「はい」か「合意」と返せ。決済リンクを送る。`;
-            await updateNegotiationSession(
-              session.id,
-              {},
-              {
-                discount_applied: true
-              }
-            );
-            await replyText(event, response);
-            await appendNegotiationHistory(session.id, [{ role: 'bot', content: response }]);
-            return true;
-          }
-        } else {
-          // 値下げに応じない場合の煽りメッセージ（API経由）
-          const priceStr = price.toLocaleString();
-          const baseMessage = `金がない？それなら先延ばし癖を直す金もないのか。`;
-          
-          // API経由で煽りメッセージを生成
-          const apiMessage = await generateNegotiationMessage({
-            userMessage: trimmed,
-            context: {
-              price: priceStr,
-              classification: 'budget_rejection',
-              negotiationHistory: history
+        console.log('Next price:', nextPrice);
+        if (nextPrice < price) {
+          await updateNegotiationSession(
+            session.id,
+            { current_offer: nextPrice },
+            {
+              plan_price_yen: nextPrice,
+              discount_applied: true
             }
-          });
-          
-          const response = `${baseMessage}\n\n${apiMessage}\n\n決めるなら「はい」か「合意」と返せ。決済リンクを送る。`;
+          );
+          const oldPriceStr = price.toLocaleString();
+          price = nextPrice;
+          const newPriceStr = price.toLocaleString();
+          const response = `仕方がない。¥${oldPriceStr}から¥${newPriceStr}まで妥協してやる。もう譲れない。\n\n先延ばしを止めるか、現状維持のままか。\n\n即決しろ。「はい」か「合意」と返せ。即座に決済リンクを送る。`;
           await replyText(event, response);
           await appendNegotiationHistory(session.id, [{ role: 'bot', content: response }]);
           return true;
         }
       }
-
-      const priceStr = Number.isFinite(price) ? price.toLocaleString() : PRICE_TIERS[0].toLocaleString();
-      const loss = ctx?.monthly_cost_estimate ?? session.meta?.cost_estimate_yen ?? null;
-      const lossStr = Number.isFinite(loss) ? loss.toLocaleString() : null;
-
-      let response;
-      if (classification === 'considering') {
-        response = `検討するのはいいが、結論が遅くなるほど先延ばし癖は強化される。**¥${priceStr}/月**で今日から立て直せる。決めるなら「はい」か「合意」と返せ。リンクを渡す。`;
-      } else {
-        response = `不安があるならぶつけてくれ。こちらは**¥${priceStr}/月**で毎朝叩き起こし、タスク管理とリマインダーで強制的に進める仕組みだ。乗るなら「はい」か「合意」と返せ。決済リンクを出す。`;
-      }
-
+      
+      // 値下げしない場合のAPI経由煽りメッセージ
+      const priceStr = price.toLocaleString();
+      const apiMessage = await generateNegotiationMessage({
+        userMessage: trimmed,
+        context: {
+          price: priceStr,
+          negotiationHistory: history
+        }
+      });
+      
+      const response = `${apiMessage}\n\n決めるなら「はい」か「合意」と返せ。決済リンクを送る。`;
       await replyText(event, response);
       await appendNegotiationHistory(session.id, [{ role: 'bot', content: response }]);
       return true;
@@ -847,7 +766,6 @@ async function generateNegotiationMessage({ userMessage, context }) {
     const systemPrompt = `あなたは超厳しい交渉のプロです。支払えない相手を煽りながら、支払わせるのが仕事です。
 
 価格: ¥${context.price}/月
-分類: ${context.classification}
 
 以下のルールに従って煽りメッセージを生成してください：
 1. 相手の先延ばし癖を指摘する
@@ -855,6 +773,7 @@ async function generateNegotiationMessage({ userMessage, context }) {
 3. 支払わないことのリスクを煽る
 4. 短く、強烈なメッセージにする
 5. 日本語で返答する
+6. 自然な会話になるように心がける
 
 例：
 - 「**¥${context.price}/月**で人生を変えるか、このまま先延ばしで人生を棒に振るか。」
@@ -1191,7 +1110,7 @@ function strictReminderMessage(reminder) {
     return ` 『${title}』残り30分。なぜまだ終わってないんだ。自分との約束を守れなくていいのか？`;
   }
   // T0（時刻ちょうど）
-  return `『${title}』完了報告がないのか。それでこれからの人生大丈夫なのか？`;
+  return `『${title}』完了報告がない。弱すぎる。人生大丈夫？`;
 }
 
 // 自然言語日付解析
@@ -1787,7 +1706,7 @@ async function handleEvent(event, ctx = {}) {
     });
     
     // 交渉開始メッセージ
-    const welcomeMessage = `"レンタルこわい秘書"が、あなたのタスクが終わるまで監視する。\n\nまずはお前のゴールを聞かせろ。\n\n${STATE_PROMPTS.goal}`;
+    const welcomeMessage = `"レンタルこわい秘書"が、お前を監視する。\n\nまずはお前のゴールを聞かせろ。\n\n${STATE_PROMPTS.goal}`;
     
     return client.replyMessage(event.replyToken, {
       type: 'text',
@@ -1991,7 +1910,7 @@ async function handleEvent(event, ctx = {}) {
     if (/^(ヘルプ|help|使い方|使用方法)$/i.test(text)) {
       return client.replyMessage(event.replyToken, {
         type: 'text',
-        text: '"レンタルこわい秘書"が、あなたのタスクが終わるまで監視する。\n\n⏱ セットアップ30秒 /  リマインド：期日の30分前とちょうどに"厳しめ"通知。\n\n――――――――――\n■ まずは登録\n「タスク」と送れ。\n\n――――――――――\n■ 完了・削除\n番号で一撃：完了1 / 削除1\n（迷ったら：直近を完了 / 最新を削除）\n\n――――――――――\n■ いまのタスク\n「残タスク」と送信\n\n――――――――――\n■ プラン\n無料：チャット1日3回（タスク管理は無制限）\nプロ：チャット無制限（メニュー→アップグレード）\n\n――――――――――\n■ 困ったら\n「ヘルプ」と送れ。\n\nさあ、「こんにちは」か「タスク」と送れ。\n先延ばしは許さない。やれ。'
+        text: '"レンタルこわい秘書"が、お前を監視する。\n\n セットアップ30秒 /  リマインド：期日の30分前と期日時間に警告だ。\n\n――――――――――\n■ まずは登録\n「タスク」と送れ。\n\n――――――――――\n■ 完了・削除\n番号で一撃：完了1 / 削除1\n（迷ったら：直近を完了 / 最新を削除）\n\n――――――――――\n■ いまのタスク\n「残タスク」と送信\n\n――――――――――\n■ プラン\n無料：チャット1日3回（タスク管理は無制限）\nプロ：チャット無制限（メニュー→アップグレード）\n\n――――――――――\n■ 困ったら\n「ヘルプ」と送れ。\n\nさあ、「こんにちは」か「タスク」と送れ。\n先延ばしは許さない。やれ。'
       });
     }
 
