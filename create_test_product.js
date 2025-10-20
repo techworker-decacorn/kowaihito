@@ -9,10 +9,10 @@ async function createTestProduct() {
     console.log('Creating test mode Stripe product...');
     
     const product = await stripe.products.create({
-      name: '寺子屋 AI チャット (テスト)',
-      description: 'AI チャットサービス - 月額サブスクリプション (テスト環境)',
+      name: 'レンタルこわい秘書 (テスト)',
+      description: 'AI指導官が伴走するタスク管理サブスクリプション (テスト環境)',
       metadata: {
-        service: 'terakoya-ai-chat',
+        service: 'rental-kowai-secretary',
         type: 'subscription',
         environment: 'test'
       }

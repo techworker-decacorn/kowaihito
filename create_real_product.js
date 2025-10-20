@@ -18,10 +18,10 @@ async function createRealProduct() {
     console.log('API Key:', apiKey.substring(0, 20) + '...');
     
     const product = await stripe.products.create({
-      name: '寺子屋 AI チャット',
-      description: 'AI チャットサービス - 月額サブスクリプション',
+      name: 'レンタルこわい秘書',
+      description: 'AI指導官が伴走するタスク管理サブスクリプション',
       metadata: {
-        service: 'terakoya-ai-chat',
+        service: 'rental-kowai-secretary',
         type: 'subscription'
       }
     });
